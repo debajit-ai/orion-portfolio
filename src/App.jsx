@@ -1159,7 +1159,7 @@ function AIChatWidget() {
               </div>
               <div>
                 <h3 className="text-sm font-bold text-zinc-100 font-sans tracking-tight">Ask Debajit (AI)</h3>
-                <p className="text-[10px] text-zinc-500 font-mono tracking-widest uppercase">Powered by Claude</p>
+                <p className="text-[10px] text-zinc-500 font-mono tracking-widest uppercase">Powered by Singularity Core</p>
               </div>
             </div>
             <button onClick={() => setIsOpen(false)} className="text-zinc-500 hover:text-white transition-colors">
