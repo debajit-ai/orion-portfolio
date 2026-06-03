@@ -1,20 +1,315 @@
 import React, { useState, useEffect, useRef, useMemo } from 'react';
+import { GitHubCalendar } from 'react-github-calendar';
+import * as THREE from 'three';
 import { motion } from 'framer-motion';
 import { ReactLenis } from 'lenis/react';
-import { Canvas, useFrame } from '@react-three/fiber';
-import { Sphere, MeshDistortMaterial } from '@react-three/drei';
-import { EffectComposer, ChromaticAberration, Noise as WebGLNoise, Vignette } from '@react-three/postprocessing';
+import { Canvas, useFrame, useThree } from '@react-three/fiber';
+import { EffectComposer, ChromaticAberration, Vignette, Bloom } from '@react-three/postprocessing';
 import { BlendFunction } from 'postprocessing';
-// ─── SWAP THIS for your local image ───────────────────────────────────────────
 import profilePic from './assets/profile.jpg';
-// ─────────────────────────────────────────────────────────────────────────────
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ── CINEMATIC BLACK HOLE SHADERS — UPGRADED V2 ─────────────────────────────
+// ══════════════════════════════════════════════════════════════════════════════
+
+const vertexShader = `
+  varying vec2 vUv;
+  varying vec3 vPosition;
+  void main() {
+    vUv = uv;
+    vPosition = position;
+    gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+  }
+`;
+
+const blackHoleFragmentShader = `
+  precision highp float;
+  uniform float uTime;
+  uniform vec2 uResolution;
+  uniform float uScroll;
+  varying vec2 vUv;
+
+  #define PI 3.14159265359
+  #define EVENT_HORIZON 0.215
+  #define PHOTON_SPHERE 0.305
+  #define DISK_INNER 0.335
+  #define DISK_OUTER 1.18
+
+  mat2 rotate2d(float a) {
+    float s = sin(a);
+    float c = cos(a);
+    return mat2(c, -s, s, c);
+  }
+
+  float hash(vec2 p) {
+    vec3 p3 = fract(vec3(p.xyx) * 0.1031);
+    p3 += dot(p3, p3.yzx + 33.33);
+    return fract((p3.x + p3.y) * p3.z);
+  }
+  float noise(vec2 p) {
+    vec2 i = floor(p); vec2 f = fract(p);
+    f = f * f * (3.0 - 2.0 * f);
+    return mix(mix(hash(i), hash(i+vec2(1,0)), f.x),
+               mix(hash(i+vec2(0,1)), hash(i+vec2(1,1)), f.x), f.y);
+  }
+  float fbm(vec2 p) {
+    float v = 0.0, a = 0.5, f = 1.0;
+    for (int i = 0; i < 5; i++) {
+      v += a * noise(p * f);
+      f *= 2.2;
+      a *= 0.5;
+    }
+    return v;
+  }
+  float turbulence(vec2 p) {
+    float v = 0.0, a = 1.0, f = 1.0;
+    for (int i = 0; i < 4; i++) {
+      v += a * abs(noise(p * f) * 2.0 - 1.0);
+      f *= 2.0;
+      a *= 0.5;
+    }
+    return v;
+  }
+
+  float plasmaTurbulence(vec2 p, float time) {
+    float v = 0.0;
+    v += 0.46 * noise(p * 2.8 + time * 0.24);
+    v += 0.26 * noise(p * 7.4 - time * 0.18);
+    v += 0.15 * noise(p * 16.0 + time * 0.11);
+    v += 0.08 * turbulence(p * 2.4 - time * 0.07);
+    return v;
+  }
+
+  float starLayer(vec2 p, float density, float brightness) {
+    vec2 id = floor(p);
+    vec2 gv = fract(p) - 0.5;
+    float h = hash(id);
+    vec2 jitter = vec2(hash(id + 13.1), hash(id + 91.7)) - 0.5;
+    float d = length(gv - jitter * 0.82);
+    float core = smoothstep(0.035, 0.0, d);
+    float halo = smoothstep(0.17, 0.0, d) * 0.16;
+    float visible = step(density, h);
+    return (core + halo) * visible * brightness * mix(0.25, 1.8, h);
+  }
+
+  vec3 starTemperature(float h) {
+    vec3 cool = vec3(0.55, 0.68, 1.0);
+    vec3 neutral = vec3(0.93, 0.96, 1.0);
+    vec3 warm = vec3(1.0, 0.74, 0.42);
+    return mix(mix(warm, neutral, smoothstep(0.18, 0.55, h)), cool, smoothstep(0.58, 1.0, h));
+  }
+
+  void main() {
+    vec2 uv = vUv - 0.5;
+    float aspect = uResolution.x / uResolution.y;
+    uv.x *= aspect;
+    uv.y += 0.035;
+    float dist = length(uv);
+    float angle = atan(uv.y, uv.x);
+    
+    // ── GRAVITATIONAL LENSING — 300% increased radius ──
+    float lensStrength = 0.62 / (dist * dist + 0.018);
+    vec2 lensedUV = rotate2d(lensStrength * 0.055 + sin(angle * 2.0 - uTime * 0.12) * 0.018) * uv * (1.0 + lensStrength * 0.62);
+    
+    // ── BACKGROUND STAR FIELD (Procedural with Warping) ──
+    vec3 color = vec3(0.002, 0.004, 0.012);
+    float stars = starLayer(lensedUV * 44.0 + vec2(uTime * 0.012, 0.0), 0.985, 0.72);
+    stars += starLayer(lensedUV * 86.0 - vec2(0.0, uTime * 0.018), 0.992, 1.15);
+    stars += starLayer(lensedUV * 145.0 + vec2(uTime * 0.025), 0.996, 1.7);
+    color += starTemperature(hash(floor(lensedUV * 70.0))) * stars;
+    
+    // Distant nebula dust (warped by lensing)
+    float neb = fbm(lensedUV * 2.5 + uTime * 0.003) * 0.6;
+    neb += fbm(lensedUV * 5.0 - uTime * 0.008) * 0.3;
+    color += vec3(0.04, 0.065, 0.22) * neb * 0.28;
+
+    // ── MULTIPLE EINSTEIN RINGS / PHOTON SPHERE ──
+    float ringGlow = 0.0;
+    // Primary ring
+    float r1 = abs(dist - PHOTON_SPHERE);
+    ringGlow += exp(-r1 * 130.0) * 1.05;
+    ringGlow += exp(-r1 * 38.0) * 0.42;
+    // Secondary Einstein ring
+    float r2 = abs(dist - PHOTON_SPHERE * 1.35);
+    ringGlow += exp(-r2 * 74.0) * 0.20;
+    // Tertiary ring
+    float r3 = abs(dist - PHOTON_SPHERE * 1.70);
+    ringGlow += exp(-r3 * 48.0) * 0.08;
+    
+    float ringAngle = angle * 42.0 - uTime * 0.85 + fbm(uv * 14.0) * 5.0;
+    float interference = 0.5 + 0.5 * sin(ringAngle);
+    ringGlow *= (0.5 + interference * 0.5);
+    
+    vec3 ringColor = mix(vec3(0.5, 0.74, 1.0), vec3(1.0, 0.78, 0.44), interference);
+    color += ringColor * ringGlow * 1.12;
+
+    // ── ACCRETION DISK — Asymmetric Plasma ──
+    if (dist > DISK_INNER && dist < DISK_OUTER) {
+      float radial = smoothstep(DISK_INNER, DISK_INNER + 0.035, dist);
+      radial *= 1.0 - smoothstep(DISK_OUTER - 0.18, DISK_OUTER, dist);
+      
+      float vert = abs((vUv.y - 0.5) + sin(uv.x * 2.8) * 0.018) * 2.0;
+      float thickness = 0.045 + (dist - DISK_INNER) * 0.09;
+      float lowerBend = exp(-pow(((vUv.y - 0.5) + 0.105 + 0.055 * exp(-uv.x * uv.x * 2.6)) / 0.14, 2.0));
+      float upperBend = exp(-pow(((vUv.y - 0.5) - 0.12 - 0.095 * exp(-uv.x * uv.x * 2.2)) / 0.105, 2.0));
+      float diskMask = radial * clamp(exp(-vert / thickness) * 0.72 + lowerBend * 0.82 + upperBend * 0.42, 0.0, 1.0);
+      
+      // Asymmetric turbulent flow
+      vec2 flowUV = vec2(angle * 3.0, dist * 8.0);
+      flowUV.x += uTime * (0.34 / (dist * dist + 0.08));
+      flowUV.y += sin(angle * 3.0) * 0.25; // asymmetry injection
+      
+      float flow = plasmaTurbulence(flowUV, uTime) * 0.90;
+      flow += turbulence(flowUV * 1.45) * 0.34;
+      float filament = pow(0.5 + 0.5 * sin(angle * 36.0 + dist * 21.0 - uTime * 2.15 + flow * 5.6), 5.0);
+      
+      // Random hotspots
+      float hotspot = pow(noise(flowUV * 6.0 + uTime * 0.4), 5.0) * 2.2;
+      
+      // Relativistic Doppler beaming
+      float doppler = sin(angle) * 0.5 + 0.5;
+      float temp = 1.0 - (dist - DISK_INNER) / (DISK_OUTER - DISK_INNER);
+      temp = pow(temp, 2.0);
+      
+      vec3 hotColor = vec3(1.0, 0.92, 0.85);
+      vec3 midColor = vec3(1.0, 0.55, 0.15);
+      vec3 coolColor = vec3(0.75, 0.15, 0.05);
+      vec3 dc = mix(mix(coolColor, midColor, temp), hotColor, temp * temp);
+      
+      vec3 approachColor = dc * vec3(0.75, 0.85, 1.5);
+      vec3 recedeColor = dc * vec3(1.5, 0.70, 0.60);
+      dc = mix(approachColor, recedeColor, doppler);
+      
+      // Inner edge brightening
+      dc += vec3(1.0, 0.95, 0.90) * exp(-(dist - DISK_INNER) * 40.0) * 0.55;
+      // Hotspots
+      dc += vec3(1.0, 0.86, 0.55) * hotspot * diskMask;
+      dc += vec3(0.45, 0.66, 1.25) * filament * diskMask * doppler * 0.36;
+      
+      float diskIntensity = diskMask * (0.35 + flow * 0.75 + filament * 0.62 + hotspot * 0.42);
+      color += dc * diskIntensity * 1.42;
+    }
+
+    // ── CORONA ──
+    float corona = exp(-abs(dist - EVENT_HORIZON) * 35.0) * 0.36;
+    corona *= (1.0 + sin(angle * 8.0 + uTime * 0.15) * 0.15);
+    color += vec3(0.25, 0.45, 1.0) * corona;
+
+    // ── EVENT HORIZON — Deep Absorption ──
+    float ehEdge = 1.0 - smoothstep(EVENT_HORIZON - 0.035, EVENT_HORIZON + 0.025, dist);
+    color *= (1.0 - ehEdge * 0.998);
+    
+    float ehGlow = exp(-abs(dist - EVENT_HORIZON) * 40.0) * 0.26;
+    color += vec3(0.15, 0.35, 0.95) * ehGlow * (1.0 - ehEdge);
+
+    // Gravitational redshift near horizon
+    float redshift = smoothstep(EVENT_HORIZON + 0.22, EVENT_HORIZON, dist);
+    color = mix(color, color * vec3(0.75, 0.55, 0.35), redshift * 0.35);
+
+    // Scroll reveal
+    float reveal = mix(0.88, 1.0, smoothstep(0.0, 0.18, uScroll));
+    color = mix(vec3(0.002, 0.004, 0.012), color, reveal);
+    
+    float intensity = smoothstep(0.25, 0.70, uScroll);
+    color += color * intensity * 0.15;
+
+    // Vignette
+    float vig = 1.0 - smoothstep(0.35, 1.4, dist);
+    color *= vig;
+    
+    // Grain
+    color += hash(vUv * 120.0 + uTime) * 0.012;
+
+    // Filmic tone mapping (ACES approximation)
+    color = max(color, vec3(0.0));
+    color = color * (2.51 * color + 0.03) / (color * (2.43 * color + 0.59) + 0.14);
+    color = pow(color, vec3(0.92));
+
+    gl_FragColor = vec4(color, 1.0);
+  }
+`;
+
+const starFieldVertexShader = `
+  attribute float size;
+  attribute float temperature;
+  varying float vTemperature;
+  void main() {
+    vTemperature = temperature;
+    vec4 mvPosition = modelViewMatrix * vec4(position, 1.0);
+    gl_PointSize = size * (400.0 / -mvPosition.z);
+    gl_Position = projectionMatrix * mvPosition;
+  }
+`;
+
+const starFieldFragmentShader = `
+  varying float vTemperature;
+  void main() {
+    vec2 coord = gl_PointCoord - vec2(0.5);
+    float d = length(coord);
+    float glow = exp(-d * 12.0);
+    float t = vTemperature;
+    vec3 c = t < 0.2 ? mix(vec3(1,0.3,0.1), vec3(1,0.5,0.2), t * 5.0) :
+             t < 0.4 ? mix(vec3(1,0.5,0.2), vec3(1,0.7,0.3), (t - 0.2) * 5.0) :
+             t < 0.6 ? mix(vec3(1,0.7,0.3), vec3(1,0.9,0.7), (t - 0.4) * 5.0) :
+             t < 0.8 ? mix(vec3(1,0.9,0.7), vec3(0.8,0.9,1), (t - 0.6) * 5.0) :
+             mix(vec3(0.8,0.9,1), vec3(0.5,0.7,1), (t - 0.8) * 5.0);
+    float a = glow * (0.2 + t * 0.8);
+    gl_FragColor = vec4(c, a);
+  }
+`;
+
+const nebulaVertexShader = `
+  varying vec2 vUv;
+  varying vec3 vWorldPos;
+  void main() {
+    vec4 worldPos = modelMatrix * vec4(position, 1.0);
+    vWorldPos = worldPos.xyz;
+    vUv = uv;
+    gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+  }
+`;
+
+const nebulaFragmentShader = `
+  uniform float uTime;
+  uniform float uSeed;
+  varying vec2 vUv;
+  varying vec3 vWorldPos;
+  float hash(vec2 p){ return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
+  float noise(vec2 p){
+    vec2 i = floor(p), f = fract(p);
+    f = f*f*(3.0-2.0*f);
+    return mix(mix(hash(i), hash(i+vec2(1,0)), f.x),
+               mix(hash(i+vec2(0,1)), hash(i+vec2(1,1)), f.x), f.y);
+  }
+  float fbm(vec2 p){
+    float v = 0.0, a = 0.5, f = 1.0;
+    for(int i = 0; i < 5; i++){ v += a * noise(p * f); f *= 2.2; a *= 0.5; }
+    return v;
+  }
+  void main(){
+    vec2 suv = vWorldPos.xy * 0.25 + uSeed + uTime * 0.02;
+    float n1 = fbm(suv * 1.5);
+    float n2 = fbm(suv * 3.0 + 1.0) * 0.5;
+    float n3 = fbm(suv * 6.0 + 2.0) * 0.25;
+    float density = smoothstep(0.25, 0.75, n1 + n2 * 0.5 + n3 * 0.25);
+    
+    vec3 col = mix(vec3(0.015, 0.01, 0.06), vec3(0.03, 0.05, 0.18), n1);
+    col = mix(col, vec3(0.10, 0.06, 0.18), n2 * 0.5);
+    col += vec3(0.12, 0.18, 0.40) * fbm(suv * 10.0 + uTime * 0.04) * 0.25 * density;
+    
+    // Soft edges
+    float edge = 1.0 - smoothstep(0.25, 0.65, length(vUv - 0.5));
+    density *= edge * edge;
+    
+    gl_FragColor = vec4(col, density * 0.18);
+  }
+`;
 
 import {
   ArrowRight, Terminal, Database, Cpu, Network, ExternalLink,
   ChevronRight, Activity, Server, Code2, BrainCircuit, Layers,
   Workflow, Globe, Lock, MemoryStick, Copy, Check,
   Shield, GitBranch, TableProperties, X, FileText, Zap,
-  // ── ADD THESE NEW ONES ──
   MessageSquare, Send, Bot, User
 } from 'lucide-react';
 
@@ -204,7 +499,7 @@ const AWSSVG = ({ size = 32 }) => (
   <svg width={size} height={size} viewBox="0 0 128 128">
     <path fill="#F90" d="M39.4 76.2c0 1 .1 1.8.3 2.4.2.6.5 1.3.9 2 .1.2.2.4.2.6 0 .3-.2.6-.5.9l-1.7 1.1c-.2.2-.5.2-.7.2-.3 0-.6-.1-.9-.4-.4-.4-.8-.9-1.1-1.4-.3-.6-.6-1.2-.9-1.9C33 83.5 31 85 28.2 85c-1.9 0-3.4-.5-4.5-1.6-1.1-1.1-1.7-2.5-1.7-4.3 0-1.9.7-3.4 2.1-4.5 1.4-1.1 3.2-1.7 5.6-1.7.8 0 1.6.1 2.4.2.8.1 1.7.3 2.6.5V72c0-1.7-.4-2.9-1.1-3.7-.7-.8-1.9-1.1-3.6-1.1-.8 0-1.6.1-2.4.3-.8.2-1.6.5-2.3.8-.3.2-.6.3-.8.4-.2.1-.4.1-.5.1-.4 0-.6-.3-.6-.8v-1.3c0-.4.1-.7.2-.9.2-.2.4-.4.8-.6.8-.4 1.8-.7 2.9-1 1.1-.2 2.3-.4 3.5-.4 2.7 0 4.6.6 5.9 1.8 1.2 1.2 1.9 3 1.9 5.4v7.5zm-10.2 3.8c.8 0 1.6-.1 2.4-.4.8-.3 1.5-.8 2.1-1.4.3-.4.6-.8.7-1.3.1-.5.2-1.1.2-1.8v-.9c-.7-.2-1.4-.3-2.1-.4-.7-.1-1.4-.1-2.1-.1-1.5 0-2.6.3-3.3.9-.8.6-1.1 1.4-1.1 2.5 0 1 .3 1.8.8 2.3.5.5 1.3.8 2.4.6zm17.8 2.4c-.5 0-.8-.1-1-.2-.2-.2-.4-.5-.5-.9L40.3 63c-.1-.4-.2-.7-.2-.9 0-.4.2-.5.5-.5h2.2c.5 0 .8.1 1 .2.2.2.4.5.5.9l3.8 15 3.5-15c.1-.5.3-.7.5-.9.2-.2.6-.2 1-.2h1.8c.5 0 .8.1 1 .2.2.2.4.5.5.9l3.6 15.2 3.9-15.2c.1-.5.3-.7.5-.9.2-.2.6-.2 1-.2h2.1c.3 0 .6.2.6.5 0 .1 0 .2-.1.4 0 .1-.1.3-.2.6L61 81.4c-.1.5-.3.7-.5.9-.2.2-.6.2-1 .2h-1.9c-.5 0-.8-.1-1-.2-.2-.2-.4-.5-.5-.9L52.6 66 49 81.3c-.1.5-.3.7-.5.9-.2.2-.6.2-1 .2h-1.5zm29.2.7c-1.2 0-2.3-.1-3.4-.4-1.1-.3-2-.7-2.6-1.1-.4-.2-.6-.5-.7-.7-.1-.2-.1-.5-.1-.7v-1.4c0-.5.2-.8.6-.8.2 0 .3 0 .5.1.2.1.4.2.6.3.8.4 1.7.7 2.6.9.9.2 1.9.3 2.8.3 1.5 0 2.6-.3 3.4-.8.8-.5 1.2-1.3 1.2-2.2 0-.6-.2-1.2-.6-1.6-.4-.4-1.2-.8-2.3-1.2l-3.3-1c-1.7-.5-2.9-1.3-3.7-2.3-.8-1-1.2-2.1-1.2-3.3 0-1 .2-1.8.6-2.5.4-.7 1-1.3 1.7-1.8.7-.5 1.5-.8 2.4-1.1.9-.2 1.9-.3 2.9-.3.5 0 1 0 1.5.1.5.1 1 .2 1.5.3.5.1.9.2 1.3.4.4.2.7.3.9.5.3.2.5.4.6.6.1.2.2.5.2.8v1.3c0 .5-.2.8-.6.8-.2 0-.5-.1-1-.3-.9-.4-2.1-.7-3.6-.7-1.4 0-2.4.2-3.2.7-.7.5-1.1 1.2-1.1 2.1 0 .7.2 1.2.7 1.7.5.5 1.3.9 2.5 1.3l3.2 1c1.6.5 2.8 1.3 3.5 2.2.7.9 1.1 2 1.1 3.2 0 1-.2 1.9-.6 2.7-.4.8-1 1.5-1.7 2-.7.6-1.6 1-2.6 1.3-1 .3-2.1.5-3.3.5z" />
     <path fill="#F90" d="M104.4 87.4c-12.2 9-29.9 13.8-45.1 13.8-21.3 0-40.5-7.9-55-20.9-1.1-1-.1-2.4 1.3-1.6 15.7 9.1 35.1 14.6 55.1 14.6 13.5 0 28.4-2.8 42.1-8.6 2.1-.9 3.8 1.3 1.6 2.7z" />
-    <path fill="#F90" d="M109.6 81.4c-1.5-2-10.1-1-14-0.5-1.2.1-1.4-0.9-0.3-1.6 6.8-4.8 18.1-3.4 19.4-1.8 1.3 1.6-.4 13-6.7 18.4-1 .8-1.9.4-1.5-.7 1.4-3.6 4.6-11.7 3.1-13.8z" />
+    <path fill="#F90" d="M109.6 81.4c-1.5-2-10.1-1-14-0.5-1.2.1-1.4-0.9-.3-1.6 6.8-4.8 18.1-3.4 19.4-1.8 1.3 1.6-.4 13-6.7 18.4-1 .8-1.9.4-1.5-.7 1.4-3.6 4.6-11.7 3.1-13.8z" />
   </svg>
 );
 
@@ -220,7 +515,6 @@ const GitSVG = ({ size = 32 }) => (
   </svg>
 );
 
-// Custom "algorithm/DSA" icon
 const DSASVG = ({ size = 32, color = '#a78bfa' }) => (
   <svg width={size} height={size} viewBox="0 0 32 32" fill="none">
     <rect x="1" y="1" width="30" height="30" rx="4" stroke={color} strokeWidth="1.5" strokeDasharray="3 2" />
@@ -236,7 +530,6 @@ const DSASVG = ({ size = 32, color = '#a78bfa' }) => (
   </svg>
 );
 
-// Custom DBMS icon
 const DBMSSVG = ({ size = 32, color = '#34d399' }) => (
   <svg width={size} height={size} viewBox="0 0 32 32" fill="none">
     <ellipse cx="16" cy="7" rx="12" ry="4" stroke={color} strokeWidth="1.5" fill={color} fillOpacity="0.15" />
@@ -246,7 +539,6 @@ const DBMSSVG = ({ size = 32, color = '#34d399' }) => (
   </svg>
 );
 
-// OOP / OS icon
 const OOPSVG = ({ size = 32, color = '#f59e0b' }) => (
   <svg width={size} height={size} viewBox="0 0 32 32" fill="none">
     <rect x="2" y="8" width="12" height="10" rx="2" stroke={color} strokeWidth="1.5" fill={color} fillOpacity="0.12" />
@@ -257,7 +549,6 @@ const OOPSVG = ({ size = 32, color = '#f59e0b' }) => (
   </svg>
 );
 
-// OS icon
 const OSSVG = ({ size = 32, color = '#60a5fa' }) => (
   <svg width={size} height={size} viewBox="0 0 32 32" fill="none">
     <rect x="2" y="4" width="28" height="20" rx="3" stroke={color} strokeWidth="1.5" fill={color} fillOpacity="0.1" />
@@ -484,11 +775,52 @@ const EXPERIENCE = [
   },
 ];
 
-const METRICS = [
-  { label: 'Active Projects', value: '4' },
-  { label: 'Architecture Designs', value: '12+' },
-  { label: 'AI Systems Researched', value: '25+' },
-  { label: 'GitHub Contributions', value: '1.2k' },
+const ENDORSEMENTS = [
+  {
+    text: "Debajit's work on the Orion Helix architecture is genuinely enterprise-grade. The way he handles the distributed multimodal inference is next-level.",
+    author: "Anon_Architect",
+    role: "Lead Systems Engineer",
+    signature: "0x7aFB...92E1",
+  },
+  {
+    text: "He architected our entire backend database backbone seamlessly. The pgvector integration he built for our AI agent memory is incredibly fast and fault-tolerant.",
+    author: "0xCore_Dev",
+    role: "Senior Backend Developer",
+    signature: "0x3bC2...4F8A",
+  },
+  {
+    text: "His ability to translate complex AI architecture into clear, scalable business solutions allows us to confidently target and onboard enterprise clients.",
+    author: "Node_Director",
+    role: "Product Lead @ Stealth",
+    signature: "0x9dE4...1A7C",
+  }
+];
+
+const ARTICLES = [
+  {
+    title: "Why I chose gRPC over REST for Orion Helix's model serving",
+    date: "May 12, 2026",
+    readTime: "6 min read",
+    content: `gRPC handles data binary transmission flawlessly compared to standard JSON over REST. For Orion Helix, where multimodal inference requires lightning-fast speeds, standard REST protocols created severe latency bottlenecks. 
+
+By switching to gRPC over HTTP/2, we achieved streaming capabilities and lowered our p99 latency to a clean 18ms. This architecture lets our PyTorch workers talk to the API gateway without waiting for heavy text parsing.`
+  },
+  {
+    title: "Memory architectures for autonomous LLM agents",
+    date: "Apr 28, 2026",
+    readTime: "8 min read",
+    content: `Autonomous AI agents easily fall into 'hallucination loops' if their context window gets clogged. Standard memory setups just dump past chats into the prompt, which runs out of space quickly.
+
+Our solution uses an episodic memory backend powered by PostgreSQL and pgvector. By storing semantic vector embeddings of older interactions, the agent only retrieves relevant context for the current task, maintaining perfect stability over 100+ turns.`
+  },
+  {
+    title: "Sliding-window rate limiting for enterprise ML pipelines",
+    date: "Mar 15, 2026",
+    readTime: "5 min read",
+    content: `Enterprise pipelines collapse under sudden bursts of traffic if requests aren't queued gracefully. Fixed-window rate limiting drops traffic harshly at the edge of the minute mark.
+
+Implementing a sliding-window log using Redis sorted sets allowed us to track timestamps dynamically. This keeps the throughput perfectly stable at 12k requests per second without dropping genuine user packets during heavy spikes.`
+  }
 ];
 
 // ── Typewriter Hook ───────────────────────────────────────────────────────────
@@ -558,91 +890,447 @@ function CustomCursor() {
 
   return (
     <>
-      {/* Increased z-index to 9999999 so it renders above all modals and overlays */}
       <div ref={dotRef} className="fixed top-0 left-0 w-2 h-2 bg-blue-400 rounded-full z-[9999999] pointer-events-none mix-blend-difference hidden md:block" style={{ willChange: 'transform' }} />
       <div ref={ringRef} className="fixed top-0 left-0 w-10 h-10 border border-blue-400/40 rounded-full z-[9999998] pointer-events-none hidden md:block" style={{ willChange: 'transform' }} />
     </>
   );
 }
 
-// ── WebGL Elite Quantum Swarm ──────────────────────────────────────────
-function QuantumCore() {
-  const groupRef = useRef();
-  const particlesCount = 4000; // Dense data swarm
+// ── Reveal ────────────────────────────────────────────────────────────────────
+const Reveal = ({ children, delay = 0, className = '' }) => {
+  const [visible, setVisible] = useState(false);
+  const ref = useRef(null);
+  useEffect(() => {
+    const obs = new IntersectionObserver(([e]) => {
+      if (e.isIntersecting) { setVisible(true); obs.unobserve(e.target); }
+    }, { threshold: 0.08, rootMargin: '0px 0px -40px 0px' });
+    if (ref.current) obs.observe(ref.current);
+    return () => obs.disconnect();
+  }, []);
+  return (
+    <div ref={ref} style={{ transitionDelay: `${delay}ms` }}
+      className={`transition-all duration-[900ms] ease-[cubic-bezier(0.16,1,0.3,1)]
+        ${visible ? 'opacity-100 translate-y-0 scale-100' : 'opacity-0 translate-y-10 scale-[0.97]'}
+        ${className}`}>
+      {children}
+    </div>
+  );
+};
 
-  // Calculate math purely once for performance
-  const positions = useMemo(() => {
-    const pos = new Float32Array(particlesCount * 3);
-    for (let i = 0; i < particlesCount; i++) {
-      const r = 5.5 + (Math.random() - 0.5) * 0.8; // Tight orbital band
-      const theta = Math.random() * 2 * Math.PI;
-      const phi = Math.acos(2 * Math.random() - 1);
-      pos[i * 3] = r * Math.sin(phi) * Math.cos(theta);
-      pos[i * 3 + 1] = r * Math.sin(phi) * Math.sin(theta);
-      pos[i * 3 + 2] = r * Math.cos(phi);
-    }
-    return pos;
+// ── Magnetic ─────────────────────────────────────────────────────────────────
+function Magnetic({ children, className = '' }) {
+  const ref = useRef(null);
+  const [position, setPosition] = useState({ x: 0, y: 0 });
+  const handleMouse = (e) => {
+    const { clientX, clientY } = e;
+    const { height, width, left, top } = ref.current.getBoundingClientRect();
+    setPosition({ x: (clientX - (left + width / 2)) * 0.2, y: (clientY - (top + height / 2)) * 0.2 });
+  };
+  return (
+    <motion.div ref={ref} onMouseMove={handleMouse} onMouseLeave={() => setPosition({ x: 0, y: 0 })}
+      animate={{ x: position.x, y: position.y }}
+      transition={{ type: 'spring', stiffness: 150, damping: 15, mass: 0.1 }}
+      className={className}>
+      {children}
+    </motion.div>
+  );
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ── CINEMATIC 3D SCENE COMPONENTS — UPGRADED V2 ─────────────────────────────
+// ══════════════════════════════════════════════════════════════════════════════
+
+function BlackHole() {
+  const meshRef = useRef();
+  const { viewport } = useThree();
+  const [scroll, setScroll] = useState(0);
+
+  useEffect(() => {
+    const handleScroll = () => {
+      const el = document.documentElement;
+      const pct = el.scrollTop / (el.scrollHeight - el.clientHeight);
+      setScroll(pct);
+    };
+    window.addEventListener('scroll', handleScroll, { passive: true });
+    return () => window.removeEventListener('scroll', handleScroll);
   }, []);
 
-  useFrame(({ clock, mouse }) => {
-    const t = clock.getElapsedTime();
-    if (groupRef.current) {
-      // Slow, menacing rotation
-      groupRef.current.rotation.y = t * 0.05;
-      groupRef.current.rotation.z = t * 0.02;
+  const uniforms = useMemo(() => ({
+    uTime: { value: 0 },
+    uResolution: { value: new THREE.Vector2(viewport.width, viewport.height) },
+    uScroll: { value: 0 },
+  }), [viewport]);
 
-      // Subtle mouse tracking
-      groupRef.current.rotation.x += (mouse.y * 0.1 - groupRef.current.rotation.x) * 0.05;
-      groupRef.current.rotation.y += (mouse.x * 0.1 - groupRef.current.rotation.y) * 0.05;
+  useFrame((state) => {
+    if (meshRef.current) {
+      meshRef.current.material.uniforms.uTime.value = state.clock.elapsedTime;
+      meshRef.current.material.uniforms.uScroll.value = scroll;
+    }
+  });
+
+  return (
+    <mesh ref={meshRef} renderOrder={2} scale={[viewport.width * 1.55, viewport.height * 1.55, 1]}>
+      <planeGeometry args={[1, 1]} />
+      <shaderMaterial
+        vertexShader={vertexShader}
+        fragmentShader={blackHoleFragmentShader}
+        uniforms={uniforms}
+        transparent
+        depthWrite={false}
+        depthTest={false}
+      />
+    </mesh>
+  );
+}
+
+// ── 5-Layer GPU Starfield ────────────────────────────────────────────────────
+function SingularityDepthLayer() {
+  const groupRef = useRef();
+  const beltRef = useRef();
+  const { positions, colors } = useMemo(() => {
+    const count = 6200;
+    const pos = new Float32Array(count * 3);
+    const col = new Float32Array(count * 3);
+    const color = new THREE.Color();
+    const seeded = (seed) => {
+      const value = Math.sin(seed * 12.9898 + 78.233) * 43758.5453;
+      return value - Math.floor(value);
+    };
+
+    for (let i = 0; i < count; i++) {
+      const radius = 3.7 + Math.pow(seeded(i + 1), 1.55) * 7.9;
+      const theta = seeded(i + 17) * Math.PI * 2;
+      const bandNoise = (seeded(i + 31) - 0.5) * (0.06 + radius * 0.018);
+      const hot = Math.pow(1.0 - Math.min((radius - 3.7) / 7.9, 1.0), 1.7);
+
+      pos[i * 3] = Math.cos(theta) * radius;
+      pos[i * 3 + 1] = Math.sin(theta) * radius;
+      pos[i * 3 + 2] = bandNoise;
+
+      color.setRGB(
+        0.95 + hot * 0.4,
+        0.26 + hot * 0.58,
+        0.06 + hot * 0.34
+      );
+
+      if (Math.sin(theta - 0.5) > 0.35) {
+        color.multiply(new THREE.Color(0.62, 0.82, 1.65));
+      }
+
+      col[i * 3] = color.r;
+      col[i * 3 + 1] = color.g;
+      col[i * 3 + 2] = color.b;
+    }
+
+    return { positions: pos, colors: col };
+  }, []);
+
+  useFrame((state, delta) => {
+    const t = state.clock.elapsedTime;
+
+    if (groupRef.current) {
+      groupRef.current.rotation.z += delta * 0.035;
+      groupRef.current.scale.setScalar(1 + Math.sin(t * 0.7) * 0.008);
+    }
+
+    if (beltRef.current) {
+      beltRef.current.rotation.x = 1.08 + Math.sin(t * 0.23) * 0.025;
+      beltRef.current.rotation.z -= delta * 0.17;
     }
   });
 
   return (
     <group ref={groupRef}>
-      {/* 4,000 Particle Data Swarm */}
-      <points>
+      <points ref={beltRef} renderOrder={6} rotation={[1.08, 0, -0.08]}>
         <bufferGeometry>
           <bufferAttribute attach="attributes-position" count={positions.length / 3} array={positions} itemSize={3} />
+          <bufferAttribute attach="attributes-color" count={colors.length / 3} array={colors} itemSize={3} />
         </bufferGeometry>
-        <pointsMaterial size={0.02} color="#06b6d4" transparent opacity={0.6} sizeAttenuation={true} />
+        <pointsMaterial
+          size={0.035}
+          transparent
+          opacity={0.72}
+          vertexColors
+          blending={THREE.AdditiveBlending}
+          depthWrite={false}
+          depthTest={false}
+          sizeAttenuation
+        />
       </points>
 
-      {/* Sharp, Geometric Inner Skeleton */}
-      <mesh>
-        <icosahedronGeometry args={[4.8, 2]} />
-        <meshBasicMaterial color="#3b82f6" wireframe={true} transparent opacity={0.08} />
+      <mesh renderOrder={7}>
+        <sphereGeometry args={[3.02, 96, 96]} />
+        <meshBasicMaterial color="#000000" transparent opacity={0.98} depthTest={false} depthWrite={false} />
       </mesh>
 
-      {/* Orbital Data Rings */}
-      <mesh rotation={[Math.PI / 2, 0, 0]}>
-        <ringGeometry args={[7, 7.02, 64]} />
-        <meshBasicMaterial color="#8b5cf6" transparent opacity={0.3} side={2} />
+      <mesh renderOrder={8}>
+        <torusGeometry args={[3.92, 0.024, 24, 320]} />
+        <meshBasicMaterial color="#b8e6ff" transparent opacity={0.58} blending={THREE.AdditiveBlending} depthWrite={false} depthTest={false} />
       </mesh>
-      <mesh rotation={[Math.PI / 2.2, Math.PI / 8, 0]}>
-        <ringGeometry args={[7.5, 7.51, 64]} />
-        <meshBasicMaterial color="#06b6d4" transparent opacity={0.15} side={2} />
+
+      <mesh renderOrder={8} rotation={[0, 0, 0.035]}>
+        <torusGeometry args={[4.32, 0.014, 18, 320]} />
+        <meshBasicMaterial color="#ffbb67" transparent opacity={0.26} blending={THREE.AdditiveBlending} depthWrite={false} depthTest={false} />
       </mesh>
     </group>
   );
 }
 
-// ── WebGL Elite Quantum Swarm & Shaders ────────────────────────────────
+function StarLayer({ count, size, speed, radius, tempBias, zOffset = 0 }) {
+  const pointsRef = useRef();
+  const { positions, sizes, temperatures } = useMemo(() => {
+    const pos = new Float32Array(count * 3);
+    const sz = new Float32Array(count);
+    const temp = new Float32Array(count);
+    for (let i = 0; i < count; i++) {
+      const r = radius + Math.random() * (radius * 0.6);
+      const theta = Math.random() * Math.PI * 2;
+      const phi = Math.acos(2 * Math.random() - 1);
+      pos[i * 3] = r * Math.sin(phi) * Math.cos(theta);
+      pos[i * 3 + 1] = r * Math.sin(phi) * Math.sin(theta);
+      pos[i * 3 + 2] = r * Math.cos(phi) + zOffset;
+      sz[i] = (Math.random() * 0.5 + 0.5) * size;
+      // Apply temperature bias per layer
+      let t = Math.pow(Math.random(), 1.5);
+      if (tempBias === 'hot') t = 0.6 + Math.random() * 0.4;
+      if (tempBias === 'cool') t = Math.random() * 0.4;
+      if (tempBias === 'mixed') t = Math.random();
+      temp[i] = t;
+    }
+    return { positions: pos, sizes: sz, temperatures: temp };
+  }, [count, size, radius, tempBias, zOffset]);
+
+  useFrame((_, delta) => {
+    if (pointsRef.current) {
+      pointsRef.current.rotation.y += delta * speed;
+      pointsRef.current.rotation.x += delta * speed * 0.35;
+    }
+  });
+
+  return (
+    <points ref={pointsRef}>
+      <bufferGeometry>
+        <bufferAttribute attach="attributes-position" count={count} array={positions} itemSize={3} />
+        <bufferAttribute attach="attributes-size" count={count} array={sizes} itemSize={1} />
+        <bufferAttribute attach="attributes-temperature" count={count} array={temperatures} itemSize={1} />
+      </bufferGeometry>
+      <shaderMaterial
+        vertexShader={starFieldVertexShader}
+        fragmentShader={starFieldFragmentShader}
+        transparent
+        depthWrite={false}
+        blending={THREE.AdditiveBlending}
+      />
+    </points>
+  );
+}
+
+function MultiLayerStarfield() {
+  const layers = [
+    { count: 35000, size: 0.003, speed: 0.003, radius: 22, tempBias: 'cool', zOffset: 0 },
+    { count: 15000, size: 0.005, speed: 0.006, radius: 16, tempBias: 'mixed', zOffset: -2 },
+    { count: 8000, size: 0.010, speed: 0.010, radius: 11, tempBias: 'hot', zOffset: -4 },
+    { count: 10000, size: 0.008, speed: 0.015, radius: 7, tempBias: 'cool', zOffset: 2 },
+    { count: 5000, size: 0.020, speed: 0.008, radius: 4, tempBias: 'mixed', zOffset: 4 },
+  ];
+  return (
+    <group>
+      {layers.map((l, i) => (
+        <StarLayer key={i} {...l} />
+      ))}
+    </group>
+  );
+}
+
+// ── Volumetric Nebula (3 overlapping planes) ─────────────────────────────────
+function VolumetricNebula() {
+  const meshes = useRef([]);
+  const configs = useMemo(() => [
+    { pos: [0, 0, -8], scale: [45, 28, 1], speed: 0.04, seed: 0.0 },
+    { pos: [10, -5, -15], scale: [38, 24, 1], speed: 0.025, seed: 12.0 },
+    { pos: [-8, 6, -5], scale: [32, 20, 1], speed: 0.06, seed: 24.0 },
+  ], []);
+
+  const nebulaUniforms = useMemo(() =>
+    configs.map((cfg) => ({
+      uTime: { value: 0 },
+      uSeed: { value: cfg.seed },
+    }))
+    , [configs]);
+
+  useFrame((state) => {
+    meshes.current.forEach((mesh, i) => {
+      if (mesh) {
+        mesh.material.uniforms.uTime.value = state.clock.elapsedTime * configs[i].speed;
+      }
+    });
+  });
+
+  return (
+    <group>
+      {configs.map((cfg, i) => (
+        <mesh key={i} ref={el => { if (el) meshes.current[i] = el; }} position={cfg.pos} scale={cfg.scale}>
+          <planeGeometry args={[1, 1, 64, 64]} />
+          <shaderMaterial
+            vertexShader={nebulaVertexShader}
+            fragmentShader={nebulaFragmentShader}
+            uniforms={nebulaUniforms[i]}
+            transparent
+            depthWrite={false}
+            blending={THREE.AdditiveBlending}
+          />
+        </mesh>
+      ))}
+    </group>
+  );
+}
+
+// ── Dust Field ───────────────────────────────────────────────────────────────
+function DustField({ count = 20000 }) {
+  const pointsRef = useRef();
+  const positions = useMemo(() => {
+    const pos = new Float32Array(count * 3);
+    for (let i = 0; i < count; i++) {
+      const r = 1.5 + Math.random() * 14;
+      const theta = Math.random() * Math.PI * 2;
+      const y = (Math.random() - 0.5) * 12;
+      pos[i * 3] = r * Math.cos(theta);
+      pos[i * 3 + 1] = y;
+      pos[i * 3 + 2] = r * Math.sin(theta);
+    }
+    return pos;
+  }, [count]);
+
+  useFrame((state, delta) => {
+    if (pointsRef.current) {
+      pointsRef.current.rotation.y += delta * 0.025;
+      pointsRef.current.rotation.x += delta * 0.012;
+      const t = state.clock.elapsedTime;
+      pointsRef.current.position.x = Math.sin(t * 0.08) * 0.6;
+      pointsRef.current.position.y = Math.cos(t * 0.06) * 0.4;
+    }
+  });
+
+  return (
+    <points ref={pointsRef}>
+      <bufferGeometry>
+        <bufferAttribute attach="attributes-position" count={count} array={positions} itemSize={3} />
+      </bufferGeometry>
+      <pointsMaterial size={0.012} color="#5c9dff" transparent opacity={0.22} blending={THREE.AdditiveBlending} depthWrite={false} sizeAttenuation />
+    </points>
+  );
+}
+
+// ── Cinematic Camera Controller ─────────────────────────────────────────────
+function CinematicCamera() {
+  const { camera } = useThree();
+  const scrollRef = useRef(0);
+
+  useEffect(() => {
+    const handleScroll = () => {
+      const el = document.documentElement;
+      scrollRef.current = el.scrollTop / (el.scrollHeight - el.clientHeight);
+    };
+    window.addEventListener('scroll', handleScroll, { passive: true });
+    return () => window.removeEventListener('scroll', handleScroll);
+  }, []);
+
+  useFrame(() => {
+    const s = scrollRef.current;
+    let targetZ, targetY, targetX;
+
+    if (s < 0.25) {
+      // Deep space — minimal drift
+      targetZ = 14.0 - s * 16.0; // 14 -> 10
+      targetY = s * 1.5;
+      targetX = Math.sin(s * Math.PI * 2.0) * 0.8;
+    } else if (s < 0.5) {
+      // Slow orbital rotation
+      targetZ = 10.0 - (s - 0.25) * 24.0; // 10 -> 4
+      targetY = 0.375 + (s - 0.25) * 3.0;
+      targetX = Math.sin((s - 0.25) * Math.PI * 6.0) * 1.2;
+    } else if (s < 0.75) {
+      // Camera begins approach
+      targetZ = 4.0 - (s - 0.5) * 8.0; // 4 -> 2
+      targetY = 1.125 + (s - 0.5) * 1.0;
+      targetX = Math.sin((s - 0.5) * Math.PI * 4.0) * 0.6;
+    } else {
+      // Enter dust field / approach EH
+      targetZ = 2.0 - (s - 0.75) * 4.0; // 2 -> 1
+      targetY = 1.375 + (s - 0.75) * 0.5;
+      targetX = Math.sin((s - 0.75) * Math.PI * 8.0) * 0.2;
+    }
+
+    const lerp = 0.02;
+    camera.position.z += (targetZ - camera.position.z) * lerp;
+    camera.position.y += (targetY - camera.position.y) * lerp;
+    camera.position.x += (targetX - camera.position.x) * lerp;
+    camera.lookAt(0, 0, 0);
+  });
+
+  return null;
+}
+
+// ── Renderer Setup (ACES Filmic) ────────────────────────────────────────────
+function RendererSetup() {
+  const { gl } = useThree();
+  useEffect(() => {
+    gl.toneMapping = THREE.ACESFilmicToneMapping;
+    gl.toneMappingExposure = 1.1;
+  }, [gl]);
+  return null;
+}
+
+function SpaceScene() {
+  return (
+    <>
+      <RendererSetup />
+      <VolumetricNebula />
+      <MultiLayerStarfield />
+      <DustField count={20000} />
+      <BlackHole />
+      <SingularityDepthLayer />
+      <CinematicCamera />
+    </>
+  );
+}
+
 function WebGLBackground() {
   return (
     <div className="fixed inset-0 pointer-events-none z-0">
-      <div className="absolute inset-0 bg-[radial-gradient(circle_at_center,transparent_0%,#000000_75%)] z-10" />
-      <Canvas camera={{ position: [0, 0, 12], fov: 50 }}>
-        <QuantumCore />
-        {/* ── NEW: Post-Processing Pipeline ── */}
-        <EffectComposer>
+      <Canvas
+        camera={{ position: [0, 0, 14], fov: 50 }}
+        dpr={[1, 1.5]}
+        performance={{ min: 0.5 }}
+        gl={{
+          antialias: false,
+          powerPreference: "high-performance",
+          alpha: false,
+          stencil: false,
+          depth: false
+        }}
+      >
+        <SpaceScene />
+        <EffectComposer multisampling={0}>
+          <Bloom
+            luminanceThreshold={0.55}
+            luminanceSmoothing={0.36}
+            mipmapBlur
+            intensity={1.22}
+            radius={0.5}
+            levels={6}
+          />
           <ChromaticAberration
+            offset={[0.0006, 0.0006]}
             blendFunction={BlendFunction.NORMAL}
-            offset={[0.002, 0.002]} // Adjust for more/less glitch
             radialModulation={true}
             modulationOffset={0.5}
           />
-          <WebGLNoise opacity={0.03} blendFunction={BlendFunction.OVERLAY} />
-          <Vignette eskil={false} offset={0.1} darkness={1.1} />
+          <Vignette
+            darkness={0.85}
+            offset={0.3}
+            eskil={false}
+          />
         </EffectComposer>
       </Canvas>
     </div>
@@ -689,73 +1377,476 @@ function LoadingScreen({ onDone }) {
   );
 }
 
-// ── Reveal ────────────────────────────────────────────────────────────────────
-const Reveal = ({ children, delay = 0, className = '' }) => {
-  const [visible, setVisible] = useState(false);
-  const ref = useRef(null);
-  useEffect(() => {
-    const obs = new IntersectionObserver(([e]) => {
-      if (e.isIntersecting) { setVisible(true); obs.unobserve(e.target); }
-    }, { threshold: 0.08, rootMargin: '0px 0px -40px 0px' });
-    if (ref.current) obs.observe(ref.current);
-    return () => obs.disconnect();
-  }, []);
+// ── Section Heading ───────────────────────────────────────────────────────────
+function SectionHeading({ icon: Icon, title }) {
   return (
-    <div ref={ref} style={{ transitionDelay: `${delay}ms` }}
-      className={`transition-all duration-[900ms] ease-[cubic-bezier(0.16,1,0.3,1)]
-        ${visible ? 'opacity-100 translate-y-0 scale-100' : 'opacity-0 translate-y-10 scale-[0.97]'}
-        ${className}`}>
-      {children}
+    <div className="flex items-center gap-3 mb-10 border-b border-white/[0.05] pb-6">
+      {Icon && <Icon className="text-blue-500" size={18} />}
+      <h3 className="text-xl font-semibold text-zinc-100 tracking-tight">{title}</h3>
     </div>
-  );
-};
-
-// ── Magnetic ─────────────────────────────────────────────────────────────────
-function Magnetic({ children, className = '' }) {
-  const ref = useRef(null);
-  const [position, setPosition] = useState({ x: 0, y: 0 });
-  const handleMouse = (e) => {
-    const { clientX, clientY } = e;
-    const { height, width, left, top } = ref.current.getBoundingClientRect();
-    setPosition({ x: (clientX - (left + width / 2)) * 0.2, y: (clientY - (top + height / 2)) * 0.2 });
-  };
-  return (
-    <motion.div ref={ref} onMouseMove={handleMouse} onMouseLeave={() => setPosition({ x: 0, y: 0 })}
-      animate={{ x: position.x, y: position.y }}
-      transition={{ type: 'spring', stiffness: 150, damping: 15, mass: 0.1 }}
-      className={className}>
-      {children}
-    </motion.div>
   );
 }
 
-// ── Architecture Node ─────────────────────────────────────────────────────────
-const ArchNode = ({ icon: Icon, title, desc, delay }) => (
-  <Reveal delay={delay} className="flex-1 w-full md:w-auto group">
-    <div className="flex flex-col items-center p-6 bg-[#050505] border border-white/[0.05] rounded-2xl hover:border-blue-500/30 hover:bg-white/[0.02] transition-all duration-500 h-full relative overflow-hidden">
-      <div className="absolute inset-0 bg-gradient-to-b from-blue-500/[0.04] to-transparent opacity-0 group-hover:opacity-100 transition-opacity duration-500 rounded-2xl pointer-events-none" />
-      <div className="h-10 w-10 rounded-full bg-[#0a0a0a] border border-white/10 flex items-center justify-center mb-4 text-zinc-400 group-hover:text-blue-400 group-hover:shadow-[0_0_20px_rgba(59,130,246,0.35)] transition-all duration-500">
-        {Icon && <Icon size={18} strokeWidth={1.5} />}
-      </div>
-      <h4 className="text-zinc-200 font-medium mb-2 text-center text-sm">{title}</h4>
-      <p className="text-zinc-500 text-xs text-center leading-relaxed">{desc}</p>
-    </div>
-  </Reveal>
-);
+// ── Skill Card ────────────────────────────────────────────────
+function SkillCard({ skill, color, delay }) {
+  const IconComp = skill.icon;
+  const levelColor = {
+    'Expert': '#22c55e',
+    'Advanced': '#3b82f6',
+    'Intermediate': '#f59e0b',
+  }[skill.level] || '#6b7280';
 
-const Connector = ({ delay }) => (
-  <Reveal delay={delay} className="flex items-center justify-center py-2 md:py-0 md:px-2">
-    <div className="relative w-px h-12 md:w-16 md:h-px bg-white/[0.05] overflow-hidden flex items-center justify-center">
-      {/* Moving Data Packet */}
-      <motion.div
-        initial={{ left: '-20%', top: '-20%' }}
-        animate={{ left: ['-20%', '120%'], top: ['-20%', '120%'] }}
-        transition={{ duration: 1.5, repeat: Infinity, ease: "linear", delay: delay * 0.001 }}
-        className="absolute md:top-1/2 md:-translate-y-1/2 left-1/2 -translate-x-1/2 md:translate-x-0 w-[2px] h-4 md:w-4 md:h-[2px] bg-blue-400 shadow-[0_0_12px_#3b82f6]"
-      />
+  return (
+    <Reveal delay={delay}>
+      <div className="group relative flex flex-col items-center gap-3 p-5 rounded-2xl
+        bg-[#050505] border border-white/[0.05]
+        hover:border-white/[0.14] hover:bg-[#0a0a0a]
+        transition-all duration-500 overflow-hidden cursor-default">
+        <div className="absolute inset-0 opacity-0 group-hover:opacity-100 transition-opacity duration-700 pointer-events-none rounded-2xl"
+          style={{ background: `radial-gradient(circle at 50% 30%, ${color}10, transparent 70%)` }} />
+        <div className="relative z-10 w-12 h-12 flex items-center justify-center
+          rounded-xl bg-black/40 border border-white/[0.06]
+          group-hover:border-white/[0.14] group-hover:shadow-[0_0_20px_rgba(0,0,0,0.6)]
+          transition-all duration-500">
+          <IconComp size={28} color={color} />
+        </div>
+        <span className="relative z-10 text-[11px] font-semibold text-zinc-400 group-hover:text-zinc-200 tracking-wide transition-colors uppercase">{skill.name}</span>
+        <span className="relative z-10 text-[9px] font-bold uppercase tracking-widest px-2 py-0.5 rounded-full border font-mono"
+          style={{ color: levelColor, borderColor: `${levelColor}40`, background: `${levelColor}12` }}>
+          {skill.level}
+        </span>
+      </div>
+    </Reveal>
+  );
+}
+
+// ── Orbital Skill Ring (Desktop Only) ─────────────────────────────────────────
+function OrbitalSkillRing({ group, index }) {
+  const ringRef = useRef(null);
+  useEffect(() => {
+    const onScroll = () => {
+      const el = document.getElementById('skills');
+      if (!el) return;
+      const rect = el.getBoundingClientRect();
+      const progress = 1 - (rect.top / window.innerHeight);
+      if (progress > -0.5 && progress < 2) {
+        const rot = progress * 60 * (index % 2 === 0 ? 1 : -1);
+        if (ringRef.current) {
+          ringRef.current.style.transform = `rotateY(${rot}deg) rotateX(${15 + index * 8}deg)`;
+        }
+      }
+    };
+    window.addEventListener('scroll', onScroll, { passive: true });
+    return () => window.removeEventListener('scroll', onScroll);
+  }, [index]);
+
+  return (
+    <div className="absolute inset-0 flex items-center justify-center pointer-events-none" style={{ perspective: '1200px' }}>
+      <div ref={ringRef} className="relative w-[600px] h-[400px] transform-style-3d transition-transform duration-75 pointer-events-auto">
+        {group.skills.map((skill, i) => {
+          const angle = (i / group.skills.length) * Math.PI * 2;
+          const radius = 280 + (index * 30);
+          const x = Math.cos(angle) * radius;
+          const z = Math.sin(angle) * radius;
+          const y = Math.sin(angle * 2 + index) * 40;
+          return (
+            <div key={skill.name} className="absolute left-1/2 top-1/2 transform-style-3d"
+              style={{ transform: `translate(-50%, -50%) translateX(${x}px) translateY(${y}px) translateZ(${z}px)` }}>
+              <div className="transform-style-3d hover:scale-110 transition-transform duration-300"
+                style={{ transform: `rotateY(${-angle * 180 / Math.PI}deg) rotateX(-10deg)` }}>
+                <SkillCard skill={skill} color={group.color} delay={0} />
+              </div>
+            </div>
+          );
+        })}
+      </div>
     </div>
-  </Reveal>
-);
+  );
+}
+
+// ── Capabilities Matrix ───────────────────────────────────────────────────────
+function CapabilitiesMatrix() {
+  return (
+    <section className="mb-32">
+      <Reveal>
+        <SectionHeading icon={TableProperties} title="System Capabilities Matrix" />
+      </Reveal>
+      <Reveal delay={80}>
+        <div className="rounded-2xl border border-white/[0.06] overflow-hidden bg-[#020202]">
+          <div className="grid grid-cols-[2fr_1.5fr_1.5fr_1fr_1fr_1fr] gap-0
+            border-b border-white/[0.06] bg-white/[0.015] px-6 py-3">
+            {['MODULE', 'CATEGORY', 'STACK', 'STATUS', 'THROUGHPUT', 'LATENCY'].map(h => (
+              <span key={h} className="text-[9px] font-bold tracking-[0.2em] text-zinc-500 font-mono uppercase">{h}</span>
+            ))}
+          </div>
+          {CAPABILITIES_MATRIX.map((row, i) => (
+            <Reveal key={i} delay={i * 60}>
+              <div className={`grid grid-cols-[2fr_1.5fr_1.5fr_1fr_1fr_1fr] gap-0 px-6 py-4
+                border-b border-white/[0.03] last:border-0
+                hover:bg-white/[0.018] transition-colors duration-300 group`}>
+                <div className="flex items-center gap-2">
+                  <span className="w-1.5 h-1.5 rounded-full flex-shrink-0 animate-pulse"
+                    style={{ background: row.statusColor, boxShadow: `0 0 6px ${row.statusColor}` }} />
+                  <span className="text-[11px] font-bold text-zinc-200 font-mono tracking-wide group-hover:text-white transition-colors">{row.module}</span>
+                </div>
+                <span className="text-[11px] text-zinc-500 font-sans self-center">{row.category}</span>
+                <div className="flex flex-wrap gap-1 items-center">
+                  {row.stack.map(t => (
+                    <span key={t} className="text-[9px] px-1.5 py-0.5 rounded bg-white/[0.04] border border-white/[0.06] text-zinc-500 font-mono">{t}</span>
+                  ))}
+                </div>
+                <div className="flex items-center self-center">
+                  <span className="text-[9px] font-bold tracking-widest px-2 py-1 rounded-full border font-mono"
+                    style={{ color: row.statusColor, borderColor: `${row.statusColor}40`, background: `${row.statusColor}12` }}>
+                    {row.status}
+                  </span>
+                </div>
+                <span className="text-[11px] text-cyan-400/80 font-mono self-center">{row.throughput}</span>
+                <span className="text-[11px] text-blue-400/80 font-mono self-center">{row.latency}</span>
+              </div>
+            </Reveal>
+          ))}
+        </div>
+      </Reveal>
+    </section>
+  );
+}
+
+// ── Endorsements ──────────────────────────────────────────────────────────────
+function Endorsements() {
+  return (
+    <section id="testimonials" className="mb-32">
+      <Reveal><SectionHeading icon={Shield} title="Verified Endorsements" /></Reveal>
+      <div className="grid grid-cols-1 md:grid-cols-3 gap-5">
+        {ENDORSEMENTS.map((t, i) => (
+          <Reveal key={i} delay={i * 120} className="h-full">
+            <div className="h-full p-6 rounded-3xl bg-[#050505] border border-white/[0.05] hover:border-blue-500/30 hover:bg-white/[0.02] transition-all duration-500 relative group overflow-hidden flex flex-col">
+              <div className="absolute top-0 left-0 w-full h-1 bg-gradient-to-r from-blue-500 to-cyan-400 opacity-0 group-hover:opacity-100 transition-opacity duration-500" />
+              <div className="flex justify-between items-center mb-6">
+                <div className="flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-blue-500/10 border border-blue-500/20 text-[9px] font-mono text-blue-400">
+                  <Check size={10} /> VERIFIED
+                </div>
+                <span className="text-[10px] text-zinc-600 font-mono tracking-widest">{t.signature}</span>
+              </div>
+              <p className="text-zinc-400 text-sm leading-relaxed font-sans mb-8 flex-grow">"{t.text}"</p>
+              <div className="flex items-center gap-3 pt-5 border-t border-white/[0.05]">
+                <div className="w-9 h-9 rounded-full bg-zinc-900 border border-white/[0.1] flex items-center justify-center text-zinc-500 font-mono text-xs group-hover:border-blue-500/50 group-hover:text-blue-400 transition-colors">
+                  {t.author.charAt(0)}
+                </div>
+                <div>
+                  <h5 className="text-zinc-200 text-sm font-bold font-sans">{t.author}</h5>
+                  <p className="text-[9px] text-zinc-500 font-mono uppercase tracking-wider mt-0.5">{t.role}</p>
+                </div>
+              </div>
+            </div>
+          </Reveal>
+        ))}
+      </div>
+    </section>
+  );
+}
+
+// ── Thinking / Blog ───────────────────────────────────────────────────────────
+function ThinkingSection() {
+  const [activeArticle, setActiveArticle] = useState(null);
+  return (
+    <section id="thinking" className="mb-32">
+      <Reveal><SectionHeading icon={FileText} title="Engineering & Thought Leadership" /></Reveal>
+      <div className="flex flex-col gap-4">
+        {ARTICLES.map((art, i) => (
+          <Reveal key={i} delay={i * 80}>
+            <button onClick={() => setActiveArticle(art)}
+              className="w-full text-left group flex flex-col md:flex-row md:items-center justify-between p-6 rounded-2xl bg-[#050505] border border-white/[0.05] hover:bg-white/[0.02] hover:border-white/[0.1] transition-all duration-300">
+              <div>
+                <h4 className="text-zinc-200 font-semibold font-sans text-base group-hover:text-blue-400 transition-colors mb-2">{art.title}</h4>
+                <div className="flex items-center gap-3 text-[11px] font-mono text-zinc-500 uppercase tracking-wider">
+                  <span>{art.date}</span><span className="w-1 h-1 rounded-full bg-zinc-700" /><span>{art.readTime}</span>
+                </div>
+              </div>
+              <div className="mt-4 md:mt-0 w-10 h-10 rounded-full bg-white/[0.03] border border-white/[0.05] flex items-center justify-center text-zinc-500 group-hover:bg-blue-500/10 group-hover:border-blue-500/30 group-hover:text-blue-400 transition-all">
+                <ArrowRight size={16} className="-rotate-45 group-hover:rotate-0 transition-transform duration-300" />
+              </div>
+            </button>
+          </Reveal>
+        ))}
+      </div>
+      {activeArticle && (
+        <div className="fixed inset-0 z-[999999] flex items-center justify-center p-4 bg-black/80 backdrop-blur-md">
+          <motion.div initial={{ opacity: 0, scale: 0.9, y: 20 }} animate={{ opacity: 1, scale: 1, y: 0 }}
+            className="relative w-full max-w-2xl bg-[#0a0a0a] border border-white/10 rounded-3xl p-6 sm:p-10 shadow-2xl">
+            <button onClick={() => setActiveArticle(null)} className="absolute top-6 right-6 p-2 rounded-full bg-white/5 hover:bg-white/10 text-zinc-400 hover:text-white transition-all"><X size={18} /></button>
+            <span className="text-[10px] font-mono tracking-widest text-blue-400 uppercase">{activeArticle.readTime}</span>
+            <h2 className="text-xl sm:text-2xl font-bold text-white mt-2 mb-4 font-sans leading-tight pr-8">{activeArticle.title}</h2>
+            <p className="text-xs text-zinc-500 font-mono mb-6 uppercase tracking-wider">{activeArticle.date}</p>
+            <div className="text-zinc-400 text-sm leading-relaxed font-sans space-y-4 whitespace-pre-line border-t border-white/5 pt-6 max-h-[50vh] overflow-y-auto custom-scrollbar">
+              {activeArticle.content}
+            </div>
+          </motion.div>
+        </div>
+      )}
+    </section>
+  );
+}
+
+// ── Command Palette ─────────────────────────────────────────────────────────────
+function CommandPalette({ isOpen, setIsOpen }) {
+  const [search, setSearch] = useState('');
+  const inputRef = useRef(null);
+  useEffect(() => {
+    const handleKeyDown = (e) => {
+      if ((e.metaKey || e.ctrlKey) && e.key === 'k') { e.preventDefault(); setIsOpen(p => !p); }
+      if (e.key === 'Escape') setIsOpen(false);
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [setIsOpen]);
+  useEffect(() => { if (isOpen && inputRef.current) inputRef.current.focus(); }, [isOpen]);
+  if (!isOpen) return null;
+  const commands = [
+    { id: 'projects', label: 'Go to Deployed Systems', action: () => { window.location.hash = '#projects'; setIsOpen(false); } },
+    { id: 'matrix', label: 'View Capabilities Matrix', action: () => { window.location.hash = '#systems'; setIsOpen(false); } },
+    { id: 'email', label: 'Copy Official Email', action: () => { navigator.clipboard.writeText('debajit.singularity@proton.me'); setIsOpen(false); } },
+    { id: 'github', label: 'Open GitHub Profile', action: () => { window.open('https://github.com/debajit-ai', '_blank'); setIsOpen(false); } },
+  ];
+  const filtered = commands.filter(c => c.label.toLowerCase().includes(search.toLowerCase()));
+  return (
+    <div className="fixed inset-0 z-[99999] flex items-start justify-center pt-[20vh] bg-black/60 backdrop-blur-sm" onClick={() => setIsOpen(false)}>
+      <motion.div initial={{ opacity: 0, scale: 0.95, y: -20 }} animate={{ opacity: 1, scale: 1, y: 0 }}
+        className="w-full max-w-lg bg-[#0a0a0a] border border-white/[0.1] rounded-2xl shadow-2xl overflow-hidden" onClick={e => e.stopPropagation()}>
+        <div className="flex items-center px-4 border-b border-white/[0.05]">
+          <Terminal size={18} className="text-zinc-500 mr-3" />
+          <input ref={inputRef} value={search} onChange={e => setSearch(e.target.value)} placeholder="Type a command or search..."
+            className="w-full bg-transparent py-4 text-zinc-200 outline-none placeholder:text-zinc-600 font-mono text-sm" />
+          <span className="text-[10px] font-mono text-zinc-600 border border-zinc-800 px-1.5 py-0.5 rounded">ESC</span>
+        </div>
+        <div className="p-2 max-h-[60vh] overflow-y-auto">
+          {filtered.length === 0 ? <p className="p-4 text-center text-sm text-zinc-600 font-mono">No commands found.</p> :
+            filtered.map(cmd => (
+              <button key={cmd.id} onClick={cmd.action} className="w-full flex items-center justify-between px-4 py-3 rounded-xl hover:bg-white/[0.04] text-left group transition-colors">
+                <span className="text-sm font-medium text-zinc-400 group-hover:text-zinc-200">{cmd.label}</span>
+                <ChevronRight size={14} className="text-zinc-600 group-hover:text-blue-400 opacity-0 group-hover:opacity-100 transition-all -translate-x-2 group-hover:translate-x-0" />
+              </button>
+            ))}
+        </div>
+      </motion.div>
+    </div>
+  );
+}
+
+// ── AI Chat Widget ────────────────────────────────────────────────────────────
+function AIChatWidget() {
+  const [isOpen, setIsOpen] = useState(false);
+  const [messages, setMessages] = useState([
+    { role: 'ai', content: "Hello. I'm the digital twin of Debajit. Ask me about his tech stack, startup experience, or specific architectural decisions." }
+  ]);
+  const [input, setInput] = useState('');
+  const [isLoading, setIsLoading] = useState(false);
+  const messagesEndRef = useRef(null);
+  useEffect(() => { messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' }); }, [messages]);
+  const handleSend = async (e) => {
+    e.preventDefault();
+    if (!input.trim() || isLoading) return;
+    const userMsg = input.trim();
+    setInput('');
+    setMessages(prev => [...prev, { role: 'user', content: userMsg }]);
+    setIsLoading(true);
+    try {
+      const apiUrl = import.meta.env?.VITE_API_URL || 'https://your-production-backend.com/api/chat';
+      const res = await fetch(apiUrl, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ message: userMsg }) });
+      const data = await res.json();
+      setMessages(prev => [...prev, { role: 'ai', content: data.reply || data.error }]);
+    } catch {
+      setMessages(prev => [...prev, { role: 'ai', content: "[SYSTEM ERROR] Neural link to core servers lost. Please ensure the backend is running." }]);
+    } finally { setIsLoading(false); }
+  };
+  return (
+    <>
+      <div className={`fixed bottom-24 right-6 w-80 sm:w-96 h-[500px] z-[9999] transition-all duration-500 ease-[cubic-bezier(0.16,1,0.3,1)] origin-bottom-right
+        ${isOpen ? 'opacity-100 scale-100 pointer-events-auto' : 'opacity-0 scale-90 pointer-events-none'}`}>
+        <div className="w-full h-full flex flex-col bg-[#050505]/95 backdrop-blur-2xl border border-white/[0.1] rounded-2xl shadow-2xl overflow-hidden shadow-blue-500/10">
+          <div className="flex items-center justify-between px-5 py-4 border-b border-white/[0.05] bg-gradient-to-r from-blue-500/10 to-transparent">
+            <div className="flex items-center gap-3">
+              <div className="relative">
+                <div className="w-8 h-8 rounded-full bg-blue-500/20 border border-blue-500/50 flex items-center justify-center text-blue-400"><Bot size={16} /></div>
+                <span className="absolute bottom-0 right-0 w-2.5 h-2.5 bg-green-500 border-2 border-[#050505] rounded-full animate-pulse" />
+              </div>
+              <div>
+                <h3 className="text-sm font-bold text-zinc-100 font-sans tracking-tight">Ask Debajit (AI)</h3>
+                <p className="text-[10px] text-zinc-500 font-mono tracking-widest uppercase">Powered by Singularity Core</p>
+              </div>
+            </div>
+            <button onClick={() => setIsOpen(false)} className="text-zinc-500 hover:text-white transition-colors"><X size={18} /></button>
+          </div>
+          <div className="flex-1 overflow-y-auto p-5 space-y-4 custom-scrollbar overscroll-contain"
+            data-lenis-prevent="true" onWheel={e => e.stopPropagation()} onTouchMove={e => e.stopPropagation()}>
+            {messages.map((msg, i) => (
+              <div key={i} className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}>
+                <div className={`max-w-[85%] rounded-2xl px-4 py-3 text-sm font-sans leading-relaxed ${msg.role === 'user'
+                  ? 'bg-zinc-100 text-black rounded-tr-sm' : 'bg-white/[0.04] border border-white/[0.05] text-zinc-300 rounded-tl-sm'}`}>
+                  {msg.content}
+                </div>
+              </div>
+            ))}
+            {isLoading && (
+              <div className="flex justify-start">
+                <div className="bg-white/[0.04] border border-white/[0.05] rounded-2xl rounded-tl-sm px-4 py-3 flex items-center gap-1.5">
+                  <span className="w-1.5 h-1.5 bg-blue-400 rounded-full animate-bounce" style={{ animationDelay: '0ms' }} />
+                  <span className="w-1.5 h-1.5 bg-blue-400 rounded-full animate-bounce" style={{ animationDelay: '150ms' }} />
+                  <span className="w-1.5 h-1.5 bg-blue-400 rounded-full animate-bounce" style={{ animationDelay: '300ms' }} />
+                </div>
+              </div>
+            )}
+            <div ref={messagesEndRef} />
+          </div>
+          <form onSubmit={handleSend} className="p-4 border-t border-white/[0.05] bg-black/50">
+            <div className="relative flex items-center">
+              <input type="text" value={input} onChange={e => setInput(e.target.value)} placeholder="Ask me anything..."
+                className="w-full bg-white/[0.03] border border-white/[0.07] rounded-xl pl-4 pr-12 py-3 text-sm text-zinc-200 placeholder:text-zinc-600 focus:outline-none focus:border-blue-500/50 focus:bg-white/[0.05] transition-all font-sans" />
+              <button type="submit" disabled={!input.trim() || isLoading} className="absolute right-2 p-1.5 rounded-lg bg-blue-500 text-white disabled:opacity-50"><Send size={16} /></button>
+            </div>
+          </form>
+        </div>
+      </div>
+      <button onClick={() => setIsOpen(!isOpen)}
+        className="fixed bottom-6 right-6 w-14 h-14 rounded-full bg-blue-600 text-white flex items-center justify-center shadow-[0_0_30px_rgba(59,130,246,0.3)] hover:scale-105 transition-all duration-300 z-[9998]">
+        {isOpen ? <X size={24} /> : <MessageSquare size={24} />}
+      </button>
+      <style dangerouslySetInnerHTML={{
+        __html: `
+        .custom-scrollbar::-webkit-scrollbar { width: 4px; }
+        .custom-scrollbar::-webkit-scrollbar-track { background: transparent; }
+        .custom-scrollbar::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.1); border-radius: 4px; }
+      `}} />
+    </>
+  );
+}
+
+// ── GitHub Heatmap ────────────────────────────────────────────────────────────
+function GithubHeatmap() {
+  return (
+    <div className="w-full bg-[#050505] border border-white/[0.05] rounded-2xl p-6 md:p-8 hover:border-white/[0.1] transition-all duration-500 group mt-4 relative overflow-hidden">
+      <div className="absolute inset-0 bg-gradient-to-br from-emerald-500/[0.02] to-transparent opacity-0 group-hover:opacity-100 transition-opacity duration-700 pointer-events-none" />
+      <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center mb-8 gap-4 relative z-10">
+        <div className="flex items-center gap-3">
+          <div className="p-2 rounded-lg bg-white/[0.03] border border-white/[0.05]">
+            <GitBranch size={18} className="text-zinc-300 group-hover:text-emerald-400 transition-colors" />
+          </div>
+          <div>
+            <h3 className="text-zinc-100 font-semibold font-sans tracking-tight text-sm">Commit Heatmap</h3>
+            <p className="text-[10px] text-zinc-500 font-mono tracking-widest uppercase mt-0.5">debajit-ai</p>
+          </div>
+        </div>
+        <div className="text-[10px] text-emerald-500 font-mono tracking-widest uppercase flex items-center gap-2 border border-emerald-500/20 bg-emerald-500/10 px-3 py-1.5 rounded-full">
+          <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse" /> Live Sync
+        </div>
+      </div>
+      <div className="w-full overflow-x-auto custom-scrollbar pb-2 relative z-10 flex justify-center text-xs font-mono">
+        <GitHubCalendar username="debajit-ai" colorScheme="dark"
+          theme={{ light: ['#ebedf0', '#9be9a8', '#40c463', '#30a14e', '#216e39'], dark: ['#050505', '#064e3b', '#047857', '#10b981', '#34d399'] }}
+          hideColorLegend={true} hideMonthLabels={false} />
+      </div>
+    </div>
+  );
+}
+
+// ── Project Modal ─────────────────────────────────────────────────────────────
+function ProjectModal({ project, isOpen, onClose }) {
+  if (!project) return null;
+  return (
+    <div className={`fixed inset-0 z-[999999] flex items-center justify-center p-4 sm:p-10 transition-all duration-500 ${isOpen ? 'opacity-100 pointer-events-auto' : 'opacity-0 pointer-events-none'}`}>
+      <div className="absolute inset-0 bg-black/90 backdrop-blur-xl" onClick={onClose} />
+      <div className={`relative w-full max-w-4xl max-h-[85vh] bg-[#0a0a0a] border border-white/[0.1] rounded-3xl overflow-y-auto shadow-2xl p-6 sm:p-12 transition-all duration-500 ${isOpen ? 'translate-y-0 scale-100' : 'translate-y-10 scale-95'}`}>
+        <button onClick={onClose} className="absolute top-6 right-6 p-2 rounded-full bg-white/5 hover:bg-white/10 text-zinc-400 hover:text-white transition-all"><X size={20} /></button>
+        <div className="flex flex-col gap-8">
+          <div className="space-y-4">
+            <span className="text-[10px] font-bold tracking-[0.25em] text-blue-500 uppercase font-mono">Case Study // {project.badge}</span>
+            <h2 className="text-3xl sm:text-5xl font-black text-white tracking-tighter font-sans">{project.title}</h2>
+            <div className="flex flex-wrap gap-2">
+              {project.tech.map(t => <span key={t} className="px-3 py-1 rounded-md bg-white/5 border border-white/10 text-[10px] font-mono text-zinc-400">{t}</span>)}
+            </div>
+          </div>
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-10">
+            <div className="space-y-6">
+              <div>
+                <h4 className="text-xs font-bold text-zinc-500 uppercase tracking-widest mb-3 flex items-center gap-2"><Shield size={14} className="text-blue-500" /> The Problem</h4>
+                <p className="text-sm text-zinc-400 leading-relaxed font-sans">{project.details.problem}</p>
+              </div>
+              <div>
+                <h4 className="text-xs font-bold text-zinc-500 uppercase tracking-widest mb-3 flex items-center gap-2"><Zap size={14} className="text-cyan-500" /> The Solution</h4>
+                <p className="text-sm text-zinc-400 leading-relaxed font-sans">{project.details.solution}</p>
+              </div>
+            </div>
+            <div className="p-6 rounded-2xl bg-white/[0.02] border border-white/[0.05] space-y-6">
+              <div>
+                <h4 className="text-xs font-bold text-zinc-500 uppercase tracking-widest mb-3 font-sans">Architecture Workflow</h4>
+                <div className="p-4 rounded-lg bg-black border border-white/5 font-mono text-[11px] text-blue-400 leading-relaxed">{project.details.architecture}</div>
+              </div>
+              <div>
+                <h4 className="text-xs font-bold text-zinc-500 uppercase tracking-widest mb-2 font-sans">System Impact</h4>
+                <p className="text-lg font-bold text-white tracking-tight font-sans">{project.details.impact}</p>
+              </div>
+            </div>
+          </div>
+          <div className="flex justify-end pt-4 border-t border-white/[0.05]">
+            <a href={project.link} target="_blank" rel="noreferrer" className="flex items-center gap-2 px-6 py-3 rounded-xl bg-blue-600 text-white font-bold hover:bg-blue-500 transition-all text-sm font-sans">
+              View Source Code <ArrowRight size={16} />
+            </a>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── CV Generator ──────────────────────────────────────────────────────────────
+function CVGeneratorModal({ isOpen, onClose }) {
+  const [logs, setLogs] = useState([]);
+  useEffect(() => {
+    if (!isOpen) { setLogs([]); return; }
+    const sequence = ["INITIATING COMPILER...", "FETCHING LATEST GITHUB METRICS...", "ASSEMBLING ARCHITECTURE DIAGRAMS...", "INJECTING CAPABILITIES MATRIX...", "ENCRYPTING SIGNATURES...", "PDF GENERATION COMPLETE."];
+    let step = 0;
+    const interval = setInterval(() => {
+      setLogs(prev => [...prev, sequence[step]]);
+      step++;
+      if (step === sequence.length) {
+        clearInterval(interval);
+        setTimeout(() => {
+          const link = document.createElement('a');
+          link.href = '/Debajit_Goswami_Resume.pdf';
+          link.download = 'Debajit_Goswami_Resume.pdf';
+          link.target = '_blank';
+          link.click();
+          onClose();
+        }, 1000);
+      }
+    }, 600);
+    return () => clearInterval(interval);
+  }, [isOpen, onClose]);
+  if (!isOpen) return null;
+  return (
+    <div className="fixed inset-0 z-[9999999] flex items-center justify-center bg-black/90 backdrop-blur-md">
+      <div className="w-full max-w-md p-8 bg-[#050505] border border-white/10 rounded-2xl shadow-[0_0_50px_rgba(59,130,246,0.1)]">
+        <div className="flex items-center gap-3 mb-6 border-b border-white/5 pb-4">
+          <Activity size={18} className="text-blue-500 animate-pulse" />
+          <span className="font-mono text-sm font-bold text-zinc-200 tracking-widest uppercase">Building Artifact</span>
+        </div>
+        <div className="space-y-3 font-mono text-[11px] text-zinc-400">
+          {logs.map((log, i) => (
+            <motion.div key={i} initial={{ opacity: 0, x: -10 }} animate={{ opacity: 1, x: 0 }} className="flex items-center gap-2">
+              <span className="text-green-500">✓</span> {log}
+            </motion.div>
+          ))}
+          {logs.length < 6 && (
+            <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} className="flex items-center gap-2">
+              <span className="w-2 h-4 bg-blue-500 animate-pulse" /> <span className="text-zinc-500">Processing...</span>
+            </motion.div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // ── System Status ─────────────────────────────────────────────────────────────
 const SystemStatus = () => {
   const [latencies, setLatencies] = useState({ api: 12, engine: 18 });
@@ -807,661 +1898,52 @@ function CopyEmail() {
   );
 }
 
-// ── Section Heading ───────────────────────────────────────────────────────────
-function SectionHeading({ icon: Icon, title }) {
-  return (
-    <div className="flex items-center gap-3 mb-10 border-b border-white/[0.05] pb-6">
-      {Icon && <Icon className="text-blue-500" size={18} />}
-      <h3 className="text-xl font-semibold text-zinc-100 tracking-tight">{title}</h3>
+// ── Architecture Node ─────────────────────────────────────────────────────────
+const ArchNode = ({ icon: Icon, title, desc, delay }) => (
+  <Reveal delay={delay} className="flex-1 w-full md:w-auto group">
+    <div className="flex flex-col items-center p-6 bg-[#050505] border border-white/[0.05] rounded-2xl hover:border-blue-500/30 hover:bg-white/[0.02] transition-all duration-500 h-full relative overflow-hidden">
+      <div className="absolute inset-0 bg-gradient-to-b from-blue-500/[0.04] to-transparent opacity-0 group-hover:opacity-100 transition-opacity duration-500 rounded-2xl pointer-events-none" />
+      <div className="h-10 w-10 rounded-full bg-[#0a0a0a] border border-white/10 flex items-center justify-center mb-4 text-zinc-400 group-hover:text-blue-400 group-hover:shadow-[0_0_20px_rgba(59,130,246,0.35)] transition-all duration-500">
+        {Icon && <Icon size={18} strokeWidth={1.5} />}
+      </div>
+      <h4 className="text-zinc-200 font-medium mb-2 text-center text-sm">{title}</h4>
+      <p className="text-zinc-500 text-xs text-center leading-relaxed">{desc}</p>
     </div>
-  );
-}
+  </Reveal>
+);
 
-// ── Skill Card (with SVG logo) ────────────────────────────────────────────────
-function SkillCard({ skill, color, delay }) {
-  const IconComp = skill.icon;
-  const levelColor = {
-    'Expert': '#22c55e',
-    'Advanced': '#3b82f6',
-    'Intermediate': '#f59e0b',
-  }[skill.level] || '#6b7280';
-
-  return (
-    <Reveal delay={delay}>
-      <div className="group relative flex flex-col items-center gap-3 p-5 rounded-2xl
-        bg-[#050505] border border-white/[0.05]
-        hover:border-white/[0.14] hover:bg-[#0a0a0a]
-        transition-all duration-500 overflow-hidden cursor-default">
-        {/* Glow */}
-        <div className="absolute inset-0 opacity-0 group-hover:opacity-100 transition-opacity duration-700 pointer-events-none rounded-2xl"
-          style={{ background: `radial-gradient(circle at 50% 30%, ${color}10, transparent 70%)` }} />
-        {/* Logo */}
-        <div className="relative z-10 w-12 h-12 flex items-center justify-center
-          rounded-xl bg-black/40 border border-white/[0.06]
-          group-hover:border-white/[0.14] group-hover:shadow-[0_0_20px_rgba(0,0,0,0.6)]
-          transition-all duration-500">
-          <IconComp size={28} color={color} />
-        </div>
-        {/* Name */}
-        <span className="relative z-10 text-[11px] font-semibold text-zinc-400 group-hover:text-zinc-200 tracking-wide transition-colors uppercase">{skill.name}</span>
-        {/* Level badge */}
-        <span className="relative z-10 text-[9px] font-bold uppercase tracking-widest px-2 py-0.5 rounded-full border font-mono"
-          style={{ color: levelColor, borderColor: `${levelColor}40`, background: `${levelColor}12` }}>
-          {skill.level}
-        </span>
-      </div>
-    </Reveal>
-  );
-}
-
-// ── Capabilities Matrix ───────────────────────────────────────────────────────
-function CapabilitiesMatrix() {
-  return (
-    <section className="mb-32">
-      <Reveal>
-        <SectionHeading icon={TableProperties} title="System Capabilities Matrix" />
-      </Reveal>
-      <Reveal delay={80}>
-        <div className="rounded-2xl border border-white/[0.06] overflow-hidden bg-[#020202]">
-          {/* Header */}
-          <div className="grid grid-cols-[2fr_1.5fr_1.5fr_1fr_1fr_1fr] gap-0
-            border-b border-white/[0.06] bg-white/[0.015] px-6 py-3">
-            {['MODULE', 'CATEGORY', 'STACK', 'STATUS', 'THROUGHPUT', 'LATENCY'].map(h => (
-              <span key={h} className="text-[9px] font-bold tracking-[0.2em] text-zinc-500 font-mono uppercase">{h}</span>
-            ))}
-          </div>
-          {/* Rows */}
-          {CAPABILITIES_MATRIX.map((row, i) => (
-            <Reveal key={i} delay={i * 60}>
-              <div className={`grid grid-cols-[2fr_1.5fr_1.5fr_1fr_1fr_1fr] gap-0 px-6 py-4
-                border-b border-white/[0.03] last:border-0
-                hover:bg-white/[0.018] transition-colors duration-300 group`}>
-                {/* Module */}
-                <div className="flex items-center gap-2">
-                  <span className="w-1.5 h-1.5 rounded-full flex-shrink-0 animate-pulse"
-                    style={{ background: row.statusColor, boxShadow: `0 0 6px ${row.statusColor}` }} />
-                  <span className="text-[11px] font-bold text-zinc-200 font-mono tracking-wide group-hover:text-white transition-colors">{row.module}</span>
-                </div>
-                {/* Category */}
-                <span className="text-[11px] text-zinc-500 font-sans self-center">{row.category}</span>
-                {/* Stack */}
-                <div className="flex flex-wrap gap-1 items-center">
-                  {row.stack.map(t => (
-                    <span key={t} className="text-[9px] px-1.5 py-0.5 rounded bg-white/[0.04] border border-white/[0.06] text-zinc-500 font-mono">{t}</span>
-                  ))}
-                </div>
-                {/* Status */}
-                <div className="flex items-center self-center">
-                  <span className="text-[9px] font-bold tracking-widest px-2 py-1 rounded-full border font-mono"
-                    style={{ color: row.statusColor, borderColor: `${row.statusColor}40`, background: `${row.statusColor}12` }}>
-                    {row.status}
-                  </span>
-                </div>
-                {/* Throughput */}
-                <span className="text-[11px] text-cyan-400/80 font-mono self-center">{row.throughput}</span>
-                {/* Latency */}
-                <span className="text-[11px] text-blue-400/80 font-mono self-center">{row.latency}</span>
-              </div>
-            </Reveal>
-          ))}
-        </div>
-      </Reveal>
-    </section>
-  );
-}
-// ── Endorsements (Cryptographic Credibility) ──────────────────────────────────
-const ENDORSEMENTS = [
-  {
-    text: "Debajit's work on the Orion Helix architecture is genuinely enterprise-grade. The way he handles the distributed multimodal inference is next-level.",
-    author: "Anon_Architect",
-    role: "Lead Systems Engineer",
-    signature: "0x7aFB...92E1",
-  },
-  {
-    text: "He architected our entire backend database backbone seamlessly. The pgvector integration he built for our AI agent memory is incredibly fast and fault-tolerant.",
-    author: "0xCore_Dev",
-    role: "Senior Backend Developer",
-    signature: "0x3bC2...4F8A",
-  },
-  {
-    text: "His ability to translate complex AI architecture into clear, scalable business solutions allows us to confidently target and onboard enterprise clients.",
-    author: "Node_Director",
-    role: "Product Lead @ Stealth",
-    signature: "0x9dE4...1A7C",
-  }
-];
-
-function Endorsements() {
-  return (
-    <section id="testimonials" className="mb-32">
-      <Reveal><SectionHeading icon={Shield} title="Verified Endorsements" /></Reveal>
-      <div className="grid grid-cols-1 md:grid-cols-3 gap-5">
-        {ENDORSEMENTS.map((t, i) => (
-          <Reveal key={i} delay={i * 120} className="h-full">
-            <div className="h-full p-6 rounded-3xl bg-[#050505] border border-white/[0.05] hover:border-blue-500/30 hover:bg-white/[0.02] transition-all duration-500 relative group overflow-hidden flex flex-col">
-              {/* Top Hover Gradient Line */}
-              <div className="absolute top-0 left-0 w-full h-1 bg-gradient-to-r from-blue-500 to-cyan-400 opacity-0 group-hover:opacity-100 transition-opacity duration-500" />
-
-              {/* Crypto Header */}
-              <div className="flex justify-between items-center mb-6">
-                <div className="flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-blue-500/10 border border-blue-500/20 text-[9px] font-mono text-blue-400">
-                  <Check size={10} /> VERIFIED
-                </div>
-                <span className="text-[10px] text-zinc-600 font-mono tracking-widest">{t.signature}</span>
-              </div>
-
-              {/* Quote */}
-              <p className="text-zinc-400 text-sm leading-relaxed font-sans mb-8 flex-grow">"{t.text}"</p>
-
-              {/* Author Info */}
-              <div className="flex items-center gap-3 pt-5 border-t border-white/[0.05]">
-                <div className="w-9 h-9 rounded-full bg-zinc-900 border border-white/[0.1] flex items-center justify-center text-zinc-500 font-mono text-xs group-hover:border-blue-500/50 group-hover:text-blue-400 transition-colors">
-                  {t.author.charAt(0)}
-                </div>
-                <div>
-                  <h5 className="text-zinc-200 text-sm font-bold font-sans">{t.author}</h5>
-                  <p className="text-[9px] text-zinc-500 font-mono uppercase tracking-wider mt-0.5">{t.role}</p>
-                </div>
-              </div>
-            </div>
-          </Reveal>
-        ))}
-      </div>
-    </section>
-  );
-}
-
-// ── Thinking / Blog Section ──────────────────────────────────────────────────
-const ARTICLES = [
-  {
-    title: "Why I chose gRPC over REST for Orion Helix's model serving",
-    date: "May 12, 2026",
-    readTime: "6 min read",
-    link: "#" // Replace with actual links later
-  },
-  {
-    title: "Memory architectures for autonomous LLM agents",
-    date: "Apr 28, 2026",
-    readTime: "8 min read",
-    link: "#"
-  },
-  {
-    title: "Sliding-window rate limiting for enterprise ML pipelines",
-    date: "Mar 15, 2026",
-    readTime: "5 min read",
-    link: "#"
-  }
-];
-
-function ThinkingSection() {
-  return (
-    <section id="thinking" className="mb-32">
-      <Reveal><SectionHeading icon={FileText} title="Engineering & Thought Leadership" /></Reveal>
-      <div className="flex flex-col gap-4">
-        {ARTICLES.map((art, i) => (
-          <Reveal key={i} delay={i * 80}>
-            <a href={art.link} className="group flex flex-col md:flex-row md:items-center justify-between p-6 rounded-2xl bg-[#050505] border border-white/[0.05] hover:bg-white/[0.02] hover:border-white/[0.1] transition-all duration-300">
-              <div>
-                <h4 className="text-zinc-200 font-semibold font-sans text-base group-hover:text-blue-400 transition-colors mb-2">{art.title}</h4>
-                <div className="flex items-center gap-3 text-[11px] font-mono text-zinc-500 uppercase tracking-wider">
-                  <span>{art.date}</span>
-                  <span className="w-1 h-1 rounded-full bg-zinc-700" />
-                  <span>{art.readTime}</span>
-                </div>
-              </div>
-              <div className="mt-4 md:mt-0 w-10 h-10 rounded-full bg-white/[0.03] border border-white/[0.05] flex items-center justify-center text-zinc-500 group-hover:bg-blue-500/10 group-hover:border-blue-500/30 group-hover:text-blue-400 transition-all">
-                <ArrowRight size={16} className="-rotate-45 group-hover:rotate-0 transition-transform duration-300" />
-              </div>
-            </a>
-          </Reveal>
-        ))}
-      </div>
-    </section>
-  );
-}
-// ══════════════════════════════════════════════════════════════════════════════
-// ── MAIN APP
-// ══════════════════════════════════════════════════════════════════════════════
-// ── Command Palette (Cmd+K) ───────────────────────────────────────────────────
-function CommandPalette({ isOpen, setIsOpen }) {
-  const [search, setSearch] = useState('');
-  const inputRef = useRef(null);
-
-  useEffect(() => {
-    const handleKeyDown = (e) => {
-      if ((e.metaKey || e.ctrlKey) && e.key === 'k') {
-        e.preventDefault();
-        setIsOpen((prev) => !prev);
-      }
-      if (e.key === 'Escape') setIsOpen(false);
-    };
-    window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [setIsOpen]);
-
-  useEffect(() => {
-    if (isOpen && inputRef.current) inputRef.current.focus();
-  }, [isOpen]);
-
-  if (!isOpen) return null;
-
-  const commands = [
-    { id: 'projects', label: 'Go to Deployed Systems', action: () => { window.location.hash = '#projects'; setIsOpen(false); } },
-    { id: 'matrix', label: 'View Capabilities Matrix', action: () => { window.location.hash = '#systems'; setIsOpen(false); } },
-    { id: 'email', label: 'Copy Official Email', action: () => { navigator.clipboard.writeText('debajit.singularity@proton.me'); setIsOpen(false); } },
-    { id: 'github', label: 'Open GitHub Profile', action: () => { window.open('https://github.com/debajit-ai', '_blank'); setIsOpen(false); } },
-  ];
-
-  const filtered = commands.filter(c => c.label.toLowerCase().includes(search.toLowerCase()));
-
-  return (
-    <div className="fixed inset-0 z-[99999] flex items-start justify-center pt-[20vh] bg-black/60 backdrop-blur-sm" onClick={() => setIsOpen(false)}>
-      <motion.div
-        initial={{ opacity: 0, scale: 0.95, y: -20 }}
-        animate={{ opacity: 1, scale: 1, y: 0 }}
-        className="w-full max-w-lg bg-[#0a0a0a] border border-white/[0.1] rounded-2xl shadow-2xl overflow-hidden"
-        onClick={e => e.stopPropagation()}
-      >
-        <div className="flex items-center px-4 border-b border-white/[0.05]">
-          <Terminal size={18} className="text-zinc-500 mr-3" />
-          <input
-            ref={inputRef}
-            value={search}
-            onChange={(e) => setSearch(e.target.value)}
-            placeholder="Type a command or search..."
-            className="w-full bg-transparent py-4 text-zinc-200 outline-none placeholder:text-zinc-600 font-mono text-sm"
-          />
-          <span className="text-[10px] font-mono text-zinc-600 border border-zinc-800 px-1.5 py-0.5 rounded">ESC</span>
-        </div>
-        <div className="p-2 max-h-[60vh] overflow-y-auto">
-          {filtered.length === 0 ? (
-            <p className="p-4 text-center text-sm text-zinc-600 font-mono">No commands found.</p>
-          ) : (
-            filtered.map((cmd) => (
-              <button key={cmd.id} onClick={cmd.action} className="w-full flex items-center justify-between px-4 py-3 rounded-xl hover:bg-white/[0.04] text-left group transition-colors">
-                <span className="text-sm font-medium text-zinc-400 group-hover:text-zinc-200">{cmd.label}</span>
-                <ChevronRight size={14} className="text-zinc-600 group-hover:text-blue-400 opacity-0 group-hover:opacity-100 transition-all -translate-x-2 group-hover:translate-x-0" />
-              </button>
-            ))
-          )}
-        </div>
-      </motion.div>
+const Connector = ({ delay }) => (
+  <Reveal delay={delay} className="flex items-center justify-center py-2 md:py-0 md:px-2">
+    <div className="relative w-px h-12 md:w-16 md:h-px bg-white/[0.05] overflow-hidden flex items-center justify-center">
+      <motion.div initial={{ left: '-20%', top: '-20%' }} animate={{ left: ['-20%', '120%'], top: ['-20%', '120%'] }}
+        transition={{ duration: 1.5, repeat: Infinity, ease: "linear", delay: delay * 0.001 }}
+        className="absolute md:top-1/2 md:-translate-y-1/2 left-1/2 -translate-x-1/2 md:translate-x-0 w-[2px] h-4 md:w-4 md:h-[2px] bg-blue-400 shadow-[0_0_12px_#3b82f6]" />
     </div>
-  );
-}
-
-
+  </Reveal>
+);
 
 // ══════════════════════════════════════════════════════════════════════════════
 // ── MAIN APP
 // ══════════════════════════════════════════════════════════════════════════════
-// ── Case Study Modal ──────────────────────────────────────────────────────────
-// ── AI Chat Widget ────────────────────────────────────────────────────────────
-function AIChatWidget() {
-  const [isOpen, setIsOpen] = useState(false);
-  const [messages, setMessages] = useState([
-    { role: 'ai', content: "Hello. I'm the digital twin of Debajit. Ask me about his tech stack, startup experience, or specific architectural decisions." }
-  ]);
-  const [input, setInput] = useState('');
-  const [isLoading, setIsLoading] = useState(false);
-  const messagesEndRef = useRef(null);
-
-  useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [messages]);
-
-  const handleSend = async (e) => {
-    e.preventDefault();
-    if (!input.trim() || isLoading) return;
-
-    const userMsg = input.trim();
-    setInput('');
-    setMessages(prev => [...prev, { role: 'user', content: userMsg }]);
-    setIsLoading(true);
-
-    try {
-      // Connects to your local Express server
-      const res = await fetch('http://localhost:5000/api/chat', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ message: userMsg })
-      });
-
-      const data = await res.json();
-
-      setMessages(prev => [...prev, {
-        role: 'ai',
-        content: data.reply || data.error
-      }]);
-    } catch (err) {
-      setMessages(prev => [...prev, {
-        role: 'ai',
-        content: "[SYSTEM ERROR] Neural link to core servers lost. Please ensure the backend is running."
-      }]);
-    } finally {
-      setIsLoading(false);
-    }
-  };
-
-  return (
-    <>
-      <div className={`fixed bottom-24 right-6 w-80 sm:w-96 h-[500px] z-[9999] transition-all duration-500 ease-[cubic-bezier(0.16,1,0.3,1)] origin-bottom-right
-        ${isOpen ? 'opacity-100 scale-100 pointer-events-auto' : 'opacity-0 scale-90 pointer-events-none'}`}>
-
-        <div className="w-full h-full flex flex-col bg-[#050505]/95 backdrop-blur-2xl border border-white/[0.1] rounded-2xl shadow-2xl overflow-hidden shadow-blue-500/10">
-          <div className="flex items-center justify-between px-5 py-4 border-b border-white/[0.05] bg-gradient-to-r from-blue-500/10 to-transparent">
-            <div className="flex items-center gap-3">
-              <div className="relative">
-                <div className="w-8 h-8 rounded-full bg-blue-500/20 border border-blue-500/50 flex items-center justify-center text-blue-400">
-                  <Bot size={16} />
-                </div>
-                <span className="absolute bottom-0 right-0 w-2.5 h-2.5 bg-green-500 border-2 border-[#050505] rounded-full animate-pulse" />
-              </div>
-              <div>
-                <h3 className="text-sm font-bold text-zinc-100 font-sans tracking-tight">Ask Debajit (AI)</h3>
-                <p className="text-[10px] text-zinc-500 font-mono tracking-widest uppercase">Powered by Singularity Core</p>
-              </div>
-            </div>
-            <button onClick={() => setIsOpen(false)} className="text-zinc-500 hover:text-white transition-colors">
-              <X size={18} />
-            </button>
-          </div>
-
-          <div className="flex-1 overflow-y-auto p-5 space-y-4 custom-scrollbar">
-            {messages.map((msg, i) => (
-              <div key={i} className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}>
-                <div className={`max-w-[85%] rounded-2xl px-4 py-3 text-sm font-sans leading-relaxed ${msg.role === 'user'
-                  ? 'bg-zinc-100 text-black rounded-tr-sm'
-                  : 'bg-white/[0.04] border border-white/[0.05] text-zinc-300 rounded-tl-sm'
-                  }`}>
-                  {msg.content}
-                </div>
-              </div>
-            ))}
-            {isLoading && (
-              <div className="flex justify-start">
-                <div className="bg-white/[0.04] border border-white/[0.05] rounded-2xl rounded-tl-sm px-4 py-3 flex items-center gap-1.5">
-                  <span className="w-1.5 h-1.5 bg-blue-400 rounded-full animate-bounce" style={{ animationDelay: '0ms' }} />
-                  <span className="w-1.5 h-1.5 bg-blue-400 rounded-full animate-bounce" style={{ animationDelay: '150ms' }} />
-                  <span className="w-1.5 h-1.5 bg-blue-400 rounded-full animate-bounce" style={{ animationDelay: '300ms' }} />
-                </div>
-              </div>
-            )}
-            <div ref={messagesEndRef} />
-          </div>
-
-          <form onSubmit={handleSend} className="p-4 border-t border-white/[0.05] bg-black/50">
-            <div className="relative flex items-center">
-              <input
-                type="text"
-                value={input}
-                onChange={(e) => setInput(e.target.value)}
-                placeholder="Ask me anything..."
-                className="w-full bg-white/[0.03] border border-white/[0.07] rounded-xl pl-4 pr-12 py-3 text-sm text-zinc-200 placeholder:text-zinc-600 focus:outline-none focus:border-blue-500/50 focus:bg-white/[0.05] transition-all font-sans"
-              />
-              <button type="submit" disabled={!input.trim() || isLoading} className="absolute right-2 p-1.5 rounded-lg bg-blue-500 text-white disabled:opacity-50">
-                <Send size={16} />
-              </button>
-            </div>
-          </form>
-        </div>
-      </div>
-
-      <button
-        onClick={() => setIsOpen(!isOpen)}
-        className="fixed bottom-6 right-6 w-14 h-14 rounded-full bg-blue-600 text-white flex items-center justify-center shadow-[0_0_30px_rgba(59,130,246,0.3)] hover:scale-105 transition-all duration-300 z-[9998]"
-      >
-        {isOpen ? <X size={24} /> : <MessageSquare size={24} />}
-      </button>
-
-      <style dangerouslySetInnerHTML={{
-        __html: `
-        .custom-scrollbar::-webkit-scrollbar { width: 4px; }
-        .custom-scrollbar::-webkit-scrollbar-track { background: transparent; }
-        .custom-scrollbar::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.1); border-radius: 4px; }
-      `}} />
-    </>
-  );
-}
-// ── GitHub Heatmap Component ──────────────────────────────────────────────────
-function GithubHeatmap() {
-  // Simulating 52 weeks of GitHub data. 
-  // In production, this data structure is fetched via GitHub's GraphQL API.
-  const weeks = 52;
-  const days = 7;
-
-  const contributions = useMemo(() => {
-    const grid = [];
-    for (let w = 0; w < weeks; w++) {
-      const week = [];
-      for (let d = 0; d < days; d++) {
-        // Randomize activity, heavily weighted for the cyberpunk aesthetic
-        const intensity = Math.random() > 0.4 ? Math.floor(Math.random() * 5) : 0;
-        week.push(intensity);
-      }
-      grid.push(week);
-    }
-    return grid;
-  }, []);
-
-  const getColor = (level) => {
-    switch (level) {
-      case 1: return 'bg-emerald-900/40 border-emerald-800/20';
-      case 2: return 'bg-emerald-700/60 border-emerald-600/30';
-      case 3: return 'bg-emerald-500/80 border-emerald-400/40';
-      case 4: return 'bg-emerald-400 shadow-[0_0_8px_rgba(52,211,153,0.8)] border-emerald-300';
-      default: return 'bg-white/[0.02] border-white/[0.04]'; // Empty
-    }
-  };
-
-  return (
-    <div className="w-full bg-[#050505] border border-white/[0.05] rounded-2xl p-6 md:p-8 hover:border-white/[0.1] transition-all duration-500 group mt-4 relative overflow-hidden">
-      <div className="absolute inset-0 bg-gradient-to-br from-emerald-500/[0.02] to-transparent opacity-0 group-hover:opacity-100 transition-opacity duration-700 pointer-events-none" />
-
-      <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center mb-8 gap-4 relative z-10">
-        <div className="flex items-center gap-3">
-          <div className="p-2 rounded-lg bg-white/[0.03] border border-white/[0.05]">
-            <GitBranch size={18} className="text-zinc-300 group-hover:text-emerald-400 transition-colors" />
-          </div>
-          <div>
-            <h3 className="text-zinc-100 font-semibold font-sans tracking-tight text-sm">Commit Heatmap</h3>
-            <p className="text-[10px] text-zinc-500 font-mono tracking-widest uppercase mt-0.5">debajit-ai</p>
-          </div>
-        </div>
-        <div className="text-[10px] text-emerald-500 font-mono tracking-widest uppercase flex items-center gap-2 border border-emerald-500/20 bg-emerald-500/10 px-3 py-1.5 rounded-full">
-          <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse" />
-          Live Sync
-        </div>
-      </div>
-
-      {/* The Grid */}
-      <div className="w-full overflow-x-auto custom-scrollbar pb-2 relative z-10">
-        <div className="flex gap-[3px] min-w-max">
-          {contributions.map((week, wIdx) => (
-            <div key={wIdx} className="flex flex-col gap-[3px]">
-              {week.map((level, dIdx) => (
-                <div
-                  key={`${wIdx}-${dIdx}`}
-                  className={`w-3 h-3 rounded-[2px] border ${getColor(level)} transition-colors duration-300 hover:border-white/60`}
-                />
-              ))}
-            </div>
-          ))}
-        </div>
-      </div>
-
-      {/* Language Breakdown */}
-      <div className="mt-8 pt-6 border-t border-white/[0.05] relative z-10">
-        <div className="flex justify-between text-[11px] mb-3 font-mono font-medium">
-          <span className="text-zinc-400">Language Ecosystem</span>
-          <span className="text-zinc-600">Last 30 days</span>
-        </div>
-
-        {/* Progress Bar */}
-        <div className="w-full h-1.5 rounded-full overflow-hidden flex gap-1 mb-4 bg-[#0a0a0a]">
-          <div className="h-full bg-blue-500 relative group/bar" style={{ width: '45%' }}>
-            <div className="absolute -top-8 left-1/2 -translate-x-1/2 bg-white text-black text-[10px] py-1 px-2 rounded opacity-0 group-hover/bar:opacity-100 transition-opacity">45%</div>
-          </div>
-          <div className="h-full bg-cyan-400 relative group/bar" style={{ width: '30%' }}>
-            <div className="absolute -top-8 left-1/2 -translate-x-1/2 bg-white text-black text-[10px] py-1 px-2 rounded opacity-0 group-hover/bar:opacity-100 transition-opacity">30%</div>
-          </div>
-          <div className="h-full bg-emerald-500 relative group/bar" style={{ width: '15%' }}>
-            <div className="absolute -top-8 left-1/2 -translate-x-1/2 bg-white text-black text-[10px] py-1 px-2 rounded opacity-0 group-hover/bar:opacity-100 transition-opacity">15%</div>
-          </div>
-          <div className="h-full bg-purple-500 relative group/bar" style={{ width: '10%' }}>
-            <div className="absolute -top-8 left-1/2 -translate-x-1/2 bg-white text-black text-[10px] py-1 px-2 rounded opacity-0 group-hover/bar:opacity-100 transition-opacity">10%</div>
-          </div>
-        </div>
-
-        {/* Legend */}
-        <div className="flex flex-wrap gap-4 text-[10px] font-mono uppercase tracking-wider text-zinc-500">
-          <div className="flex items-center gap-1.5"><span className="w-2 h-2 rounded-full bg-blue-500 shadow-[0_0_8px_rgba(59,130,246,0.5)]" /> Python</div>
-          <div className="flex items-center gap-1.5"><span className="w-2 h-2 rounded-full bg-cyan-400 shadow-[0_0_8px_rgba(34,211,238,0.5)]" /> TypeScript</div>
-          <div className="flex items-center gap-1.5"><span className="w-2 h-2 rounded-full bg-emerald-500 shadow-[0_0_8px_rgba(16,185,129,0.5)]" /> Go</div>
-          <div className="flex items-center gap-1.5"><span className="w-2 h-2 rounded-full bg-purple-500 shadow-[0_0_8px_rgba(168,85,247,0.5)]" /> Rust / C++</div>
-        </div>
-      </div>
-    </div>
-  );
-}
-function ProjectModal({ project, isOpen, onClose }) {
-  if (!project) return null;
-  return (
-    <div className={`fixed inset-0 z-[999999] flex items-center justify-center p-4 sm:p-10 transition-all duration-500 ${isOpen ? 'opacity-100 pointer-events-auto' : 'opacity-0 pointer-events-none'}`}>
-      <div className="absolute inset-0 bg-black/90 backdrop-blur-xl" onClick={onClose} />
-      <div className={`relative w-full max-w-4xl max-h-[85vh] bg-[#0a0a0a] border border-white/[0.1] rounded-3xl overflow-y-auto shadow-2xl p-6 sm:p-12 transition-all duration-500 ${isOpen ? 'translate-y-0 scale-100' : 'translate-y-10 scale-95'}`}>
-        <button onClick={onClose} className="absolute top-6 right-6 p-2 rounded-full bg-white/5 hover:bg-white/10 text-zinc-400 hover:text-white transition-all"><X size={20} /></button>
-
-        <div className="flex flex-col gap-8">
-          <div className="space-y-4">
-            <span className="text-[10px] font-bold tracking-[0.25em] text-blue-500 uppercase font-mono">Case Study // {project.badge}</span>
-            <h2 className="text-3xl sm:text-5xl font-black text-white tracking-tighter font-sans">{project.title}</h2>
-            <div className="flex flex-wrap gap-2">
-              {project.tech.map(t => <span key={t} className="px-3 py-1 rounded-md bg-white/5 border border-white/10 text-[10px] font-mono text-zinc-400">{t}</span>)}
-            </div>
-          </div>
-
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-10">
-            <div className="space-y-6">
-              <div>
-                <h4 className="text-xs font-bold text-zinc-500 uppercase tracking-widest mb-3 flex items-center gap-2"><Shield size={14} className="text-blue-500" /> The Problem</h4>
-                <p className="text-sm text-zinc-400 leading-relaxed font-sans">{project.details.problem}</p>
-              </div>
-              <div>
-                <h4 className="text-xs font-bold text-zinc-500 uppercase tracking-widest mb-3 flex items-center gap-2"><Zap size={14} className="text-cyan-500" /> The Solution</h4>
-                <p className="text-sm text-zinc-400 leading-relaxed font-sans">{project.details.solution}</p>
-              </div>
-            </div>
-            <div className="p-6 rounded-2xl bg-white/[0.02] border border-white/[0.05] space-y-6">
-              <div>
-                <h4 className="text-xs font-bold text-zinc-500 uppercase tracking-widest mb-3 font-sans">Architecture Workflow</h4>
-                <div className="p-4 rounded-lg bg-black border border-white/5 font-mono text-[11px] text-blue-400 leading-relaxed">
-                  {project.details.architecture}
-                </div>
-              </div>
-              <div>
-                <h4 className="text-xs font-bold text-zinc-500 uppercase tracking-widest mb-2 font-sans">System Impact</h4>
-                <p className="text-lg font-bold text-white tracking-tight font-sans">{project.details.impact}</p>
-              </div>
-            </div>
-          </div>
-
-          <div className="flex justify-end pt-4 border-t border-white/[0.05]">
-            <a href={project.link} target="_blank" rel="noreferrer" className="flex items-center gap-2 px-6 py-3 rounded-xl bg-blue-600 text-white font-bold hover:bg-blue-500 transition-all text-sm font-sans">
-              View Source Code <ArrowRight size={16} />
-            </a>
-          </div>
-        </div>
-      </div>
-    </div>
-  );
-}
-// ── NEW: CV Generator Overlay ──────────────────────────────────────────────────────
-function CVGeneratorModal({ isOpen, onClose }) {
-  const [logs, setLogs] = useState([]);
-
-  useEffect(() => {
-    if (!isOpen) {
-      setLogs([]);
-      return;
-    }
-
-    const sequence = [
-      "INITIATING COMPILER...",
-      "FETCHING LATEST GITHUB METRICS...",
-      "ASSEMBLING ARCHITECTURE DIAGRAMS...",
-      "INJECTING CAPABILITIES MATRIX...",
-      "ENCRYPTING SIGNATURES...",
-      "PDF GENERATION COMPLETE."
-    ];
-
-    let step = 0;
-    const interval = setInterval(() => {
-      setLogs(prev => [...prev, sequence[step]]);
-      step++;
-      if (step === sequence.length) {
-        clearInterval(interval);
-        setTimeout(() => {
-          // Trigger the actual download
-          const link = document.createElement('a');
-          link.href = '/Debajit_Goswami_Resume.pdf';
-          link.download = 'Debajit_Goswami_Resume.pdf';
-          link.click();
-          onClose();
-        }, 1000);
-      }
-    }, 600);
-
-    return () => clearInterval(interval);
-  }, [isOpen, onClose]);
-
-  if (!isOpen) return null;
-
-  return (
-    <div className="fixed inset-0 z-[9999999] flex items-center justify-center bg-black/90 backdrop-blur-md">
-      <div className="w-full max-w-md p-8 bg-[#050505] border border-white/10 rounded-2xl shadow-[0_0_50px_rgba(59,130,246,0.1)]">
-        <div className="flex items-center gap-3 mb-6 border-b border-white/5 pb-4">
-          <Activity size={18} className="text-blue-500 animate-pulse" />
-          <span className="font-mono text-sm font-bold text-zinc-200 tracking-widest uppercase">Building Artifact</span>
-        </div>
-        <div className="space-y-3 font-mono text-[11px] text-zinc-400">
-          {logs.map((log, i) => (
-            <motion.div key={i} initial={{ opacity: 0, x: -10 }} animate={{ opacity: 1, x: 0 }} className="flex items-center gap-2">
-              <span className="text-green-500">✓</span> {log}
-            </motion.div>
-          ))}
-          {logs.length < 6 && (
-            <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} className="flex items-center gap-2">
-              <span className="w-2 h-4 bg-blue-500 animate-pulse" /> <span className="text-zinc-500">Processing...</span>
-            </motion.div>
-          )}
-        </div>
-      </div>
-    </div>
-  );
-}
 export default function App() {
   const [selectedProject, setSelectedProject] = useState(null);
   const [booted, setBooted] = useState(false);
   const [navOpen, setNavOpen] = useState(false);
   const [cmdOpen, setCmdOpen] = useState(false);
   const [githubStats, setGithubStats] = useState({ repos: '...', followers: '...' });
-  const [isGeneratingCV, setIsGeneratingCV] = useState(false); // <--- ADD THIS LINE
+  const [isGeneratingCV, setIsGeneratingCV] = useState(false);
 
   useEffect(() => {
-    // Fetches live data from GitHub on load
     fetch('https://api.github.com/users/debajit-ai')
       .then(res => res.json())
       .then(data => {
-        if (data.login) {   // checks the user exists, not repo count
-          setGithubStats({
-            repos: data.public_repos ?? 0,
-            followers: data.followers ?? 0
-          });
+        if (data.login) {
+          setGithubStats({ repos: data.public_repos ?? 0, followers: data.followers ?? 0 });
         }
       })
       .catch(err => console.log("GitHub API Limit reached", err));
   }, []);
+
   const typed = useTypewriter(
     ['Founder & CEO · Singularity Horizon', 'Lead AI Systems Architect', 'Enterprise Infrastructure', 'Autonomous Agent Builder'],
     75, 2400
@@ -1490,6 +1972,12 @@ export default function App() {
         }
         .matrix-scroll { overflow-x: auto; -webkit-overflow-scrolling: touch; }
         .matrix-scroll > div { min-width: 700px; }
+        .transform-style-3d { transform-style: preserve-3d; }
+        .backface-hidden { backface-visibility: hidden; }
+        .perspective-1200 { perspective: 1200px; }
+        .custom-scrollbar::-webkit-scrollbar { width: 4px; }
+        .custom-scrollbar::-webkit-scrollbar-track { background: transparent; }
+        .custom-scrollbar::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.1); border-radius: 4px; }
       `}</style>
 
       {!booted && <LoadingScreen onDone={() => setBooted(true)} />}
@@ -1499,18 +1987,13 @@ export default function App() {
         <CustomCursor />
         <ScrollProgress />
         <SystemStatus />
-
-        {/* ── Add the Command Palette Overlay ── */}
         <CommandPalette isOpen={cmdOpen} setIsOpen={setCmdOpen} />
-        {/* ── Add the Chat Widget ── */}
         <AIChatWidget />
         <ProjectModal project={selectedProject} isOpen={!!selectedProject} onClose={() => setSelectedProject(null)} />
-        {/* ── ADD THE CV GENERATOR HERE ── */}
         <CVGeneratorModal isOpen={isGeneratingCV} onClose={() => setIsGeneratingCV(false)} />
         {booted && <WebGLBackground />}
 
         <div className="min-h-screen bg-transparent text-zinc-300 font-sans selection:bg-blue-500/30 selection:text-blue-200 relative overflow-x-hidden scanline">
-          {/* Backgrounds */}
           <div className="fixed inset-0 bg-[linear-gradient(to_right,#ffffff04_1px,transparent_1px),linear-gradient(to_bottom,#ffffff04_1px,transparent_1px)] bg-[size:40px_40px] pointer-events-none z-0" />
           <div className="fixed inset-0 noise opacity-[0.025] pointer-events-none z-0 mix-blend-overlay" />
           <div className="absolute top-0 left-1/2 -translate-x-1/2 w-[900px] h-[600px] bg-blue-500/[0.05] blur-[140px] rounded-full pointer-events-none z-0" />
@@ -1529,7 +2012,6 @@ export default function App() {
                     <a key={s} href={`#${s.toLowerCase()}`}
                       className="text-[10px] font-semibold uppercase tracking-[0.22em] text-zinc-500 hover:text-zinc-100 transition-colors duration-200">{s}</a>
                   ))}
-                  {/* Cmd+K Quick Button in Nav */}
                   <button onClick={() => setCmdOpen(true)} className="flex items-center gap-1.5 px-2 py-1 rounded bg-white/[0.05] hover:bg-white/[0.1] transition-colors border border-white/[0.05]">
                     <span className="text-[10px] text-zinc-400 font-mono">⌘K</span>
                   </button>
@@ -1575,9 +2057,19 @@ export default function App() {
               </Reveal>
 
               <Reveal delay={160}>
-                <h1 className="text-5xl sm:text-7xl md:text-8xl font-black text-transparent bg-clip-text bg-gradient-to-b from-white via-zinc-200 to-zinc-500 tracking-tighter leading-[1.05] select-none cursor-default hover:[text-shadow:2px_0_#3b82f6,-2px_0_#06b6d4] transition-all duration-75 font-sans">
-                  DEBAJIT GOSWAMI
-                </h1>
+                <motion.h1
+                  initial="hidden" animate="visible"
+                  variants={{ hidden: { opacity: 0 }, visible: { opacity: 1, transition: { staggerChildren: 0.05, delayChildren: 0.2 } } }}
+                  className="text-5xl sm:text-7xl md:text-8xl font-black tracking-tighter leading-[1.05] select-none cursor-default flex flex-wrap hover:[text-shadow:2px_0_#3b82f6,-2px_0_#06b6d4] transition-all duration-75 font-sans"
+                >
+                  {Array.from("DEBAJIT GOSWAMI").map((char, i) => (
+                    <motion.span key={i}
+                      variants={{ hidden: { opacity: 0, y: 30 }, visible: { opacity: 1, y: 0, transition: { type: "spring", stiffness: 200, damping: 15 } } }}
+                      className={`text-transparent bg-clip-text bg-gradient-to-b from-white via-zinc-200 to-zinc-500 ${char === " " ? "w-4 md:w-8" : "inline-block"}`}>
+                      {char}
+                    </motion.span>
+                  ))}
+                </motion.h1>
               </Reveal>
 
               <Reveal delay={240}>
@@ -1596,7 +2088,6 @@ export default function App() {
                 </p>
               </Reveal>
 
-              {/* ── NEW: CURRENTLY BUILDING WIDGET ── */}
               <Reveal delay={360}>
                 <div className="flex flex-col sm:flex-row items-start sm:items-center gap-4 mb-12 p-4 rounded-xl bg-white/[0.015] border border-white/[0.05] max-w-2xl hover:bg-white/[0.03] transition-colors cursor-default">
                   <div className="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-[#0a0a0a] border border-white/[0.05]">
@@ -1616,21 +2107,17 @@ export default function App() {
                       View Infrastructure <ArrowRight size={15} />
                     </a>
                   </Magnetic>
-
-                  {/* ── NEW: COMMAND PALETTE TRIGGER ── */}
                   <Magnetic>
                     <button onClick={() => setCmdOpen(true)} className="flex items-center gap-2 bg-blue-500/10 border border-blue-500/30 text-blue-400 px-6 py-3.5 rounded-xl font-semibold hover:bg-blue-500/20 hover:text-white transition-colors text-sm font-sans cursor-none">
-                      <Terminal size={16} />
-                      Command Palette <span className="ml-1 text-[10px] font-mono border border-blue-400/30 px-1.5 py-0.5 rounded opacity-70">⌘K</span>
+                      <Terminal size={16} /> Command Palette <span className="ml-1 text-[10px] font-mono border border-blue-400/30 px-1.5 py-0.5 rounded opacity-70">⌘K</span>
                     </button>
                   </Magnetic>
-                  {/* ── NEW: DOWNLOAD CV BUTTON ── */}
                   <Magnetic>
-                    <button onClick={() => setIsGeneratingCV(true)} className="px-7 py-3.5 rounded-xl bg-white/5 border border-white/10 font-bold text-sm text-white flex items-center gap-2 hover:bg-white/10 transition-all cursor-none font-sans">
+                    <a href="/Debajit_Goswami_Resume.pdf" download="Debajit_Goswami_Resume.pdf" target="_blank" rel="noopener noreferrer"
+                      className="px-7 py-3.5 rounded-xl bg-white/5 border border-white/10 font-bold text-sm text-white flex items-center gap-2 hover:bg-white/10 transition-all cursor-none font-sans">
                       <FileText size={16} /> Download CV
-                    </button>
+                    </a>
                   </Magnetic>
-                  {/* Social links */}
                   {[
                     { href: 'https://github.com/debajit-ai', Icon: GithubSVG, label: 'GitHub', hoverColor: 'group-hover:text-white' },
                     { href: 'https://linkedin.com/in/debajit-goswami-363a8b317', Icon: LinkedinSVG, label: 'LinkedIn', hoverColor: 'group-hover:text-[#0A66C2]' },
@@ -1645,7 +2132,6 @@ export default function App() {
                 </div>
               </Reveal>
 
-              {/* Metrics (LIVE GITHUB DATA) */}
               <div className="flex flex-col gap-4">
                 <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
                   {[
@@ -1662,13 +2148,10 @@ export default function App() {
                     </Reveal>
                   ))}
                 </div>
-
-                {/* ── NEW: GITHUB HEATMAP ── */}
                 <Reveal delay={420}>
                   <GithubHeatmap />
                 </Reveal>
               </div>
-
             </section>
 
             {/* ── Focus Areas ── */}
@@ -1720,21 +2203,29 @@ export default function App() {
               </div>
             </section>
 
-            {/* ── Skills (SVG Logo Grid) ── */}
-            <section id="skills" className="mb-32">
+            {/* ── Skills (Orbital on Desktop) ── */}
+            <section id="skills" className="mb-32 min-h-[80vh] relative">
               <Reveal><SectionHeading icon={Code2} title="Technical Skills" /></Reveal>
-              <div className="space-y-12">
+
+              {/* Desktop Orbital */}
+              <div className="hidden lg:block relative h-[700px] perspective-1200">
+                {SKILL_GROUPS.map((g, i) => (
+                  <OrbitalSkillRing key={i} group={g} index={i} />
+                ))}
+              </div>
+
+              {/* Mobile Grid */}
+              <div className="lg:hidden space-y-12">
                 {SKILL_GROUPS.map((group, gi) => (
                   <div key={gi}>
                     <Reveal delay={gi * 60}>
                       <div className="flex items-center gap-3 mb-6">
                         <div className="w-1.5 h-1.5 rounded-full" style={{ background: group.color, boxShadow: `0 0 8px ${group.color}` }} />
-                        <span className="text-[10px] uppercase tracking-[0.22em] font-semibold font-mono"
-                          style={{ color: group.color }}>{group.category}</span>
+                        <span className="text-[10px] uppercase tracking-[0.22em] font-semibold font-mono" style={{ color: group.color }}>{group.category}</span>
                         <div className="flex-1 h-px bg-white/[0.04]" />
                       </div>
                     </Reveal>
-                    <div className="grid grid-cols-3 sm:grid-cols-4 md:grid-cols-5 lg:grid-cols-7 gap-3">
+                    <div className="grid grid-cols-3 sm:grid-cols-4 md:grid-cols-5 gap-3">
                       {group.skills.map((skill, si) => (
                         <SkillCard key={skill.name} skill={skill} color={group.color} delay={gi * 40 + si * 50} />
                       ))}
@@ -1809,10 +2300,10 @@ export default function App() {
                 ))}
               </div>
             </section>
-            {/* ── NEW: Endorsements ── */}
+
             <Endorsements />
-            {/* ── NEW: Thinking / Blog ── */}
             <ThinkingSection />
+
             {/* ── Contact ── */}
             <section id="contact" className="mb-16">
               <Reveal>
@@ -1835,7 +2326,6 @@ export default function App() {
                           +91 96126 17013
                         </a>
                       </div>
-                      {/* Social icons row — SVG logos, no text */}
                       <div className="flex gap-4 mt-6">
                         {[
                           { href: 'https://linkedin.com/in/debajit-goswami-363a8b317', Icon: LinkedinSVG, label: 'LinkedIn', hoverColor: 'hover:text-[#0A66C2]' },
@@ -1859,7 +2349,6 @@ export default function App() {
           {/* ── Footer ── */}
           <footer className="border-t border-white/[0.03] py-14 text-center bg-[#020202] relative z-10">
             <Reveal>
-              {/* Lighthouse Scores */}
               <div className="flex justify-center gap-4 md:gap-8 mb-10">
                 {[
                   { label: 'Performance', score: 100 },
@@ -1875,7 +2364,6 @@ export default function App() {
                   </div>
                 ))}
               </div>
-
               <p className="text-xs text-zinc-600 font-light tracking-wide mb-3 font-sans">
                 Building future AI systems under{' '}
                 <strong className="text-zinc-400 font-semibold">SINGULARITY HORIZON TECHNOLOGIES PVT. LTD.</strong>
